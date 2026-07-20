@@ -7,7 +7,6 @@ class EchoHotkey < Formula
   head "https://github.com/joyinfant99/homebrew-echo.git", branch: "main"
 
   depends_on "sox"
-  depends_on cask: "hammerspoon"
 
   def install
     prefix.install "echo.lua"
@@ -15,6 +14,12 @@ class EchoHotkey < Formula
   end
 
   def post_install
+    # Formulas can't depend_on a cask directly, so install Hammerspoon here
+    # if it's missing rather than making the user do it as a separate step.
+    unless File.directory?("/Applications/Hammerspoon.app")
+      system HOMEBREW_BREW_FILE.to_s, "install", "--cask", "hammerspoon"
+    end
+
     hammerspoon_dir = Pathname.new(Dir.home)/".hammerspoon"
     hammerspoon_dir.mkpath
 
