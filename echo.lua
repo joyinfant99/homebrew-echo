@@ -38,6 +38,9 @@ local pulseTimer = nil
 local pulsePhase = 0
 local barTimer = nil
 local barPhase = 0
+local hideTimer = nil  -- must stay referenced: an unreferenced hs.timer can
+                        -- get garbage-collected before it fires (confirmed
+                        -- empirically), silently dropping the callback
 local micLevel = 0       -- latest level parsed from sox's meter, 0..1
 local micLevelSmoothed = 0
 
@@ -213,7 +216,7 @@ local function showSteady(text, color)
 end
 
 local function hidePillAfter(delay)
-  hs.timer.doAfter(delay, function()
+  hideTimer = hs.timer.doAfter(delay, function()
     stopPulse()
     stopBars()
     if pill then pill:hide(0.3) end -- fluid fade-out
@@ -247,6 +250,7 @@ local recordTask = nil
 local recordPath = nil
 local levelStderrBuffer = ""
 local recordingPeakLevel = 0
+local sendTimer = nil  -- must stay referenced, same reason as hideTimer above
 
 -- Below this, a recording is treated as silence rather than speech. Whisper
 -- hallucinates words from its own vocabulary prompt hint when fed silent or
@@ -308,7 +312,7 @@ local function stopRecordingAndSend()
   showDot("Transcribing", COLOR_AMBER)
 
   -- give sox a beat to flush the wav file to disk before we read it
-  hs.timer.doAfter(0.3, function()
+  sendTimer = hs.timer.doAfter(0.3, function()
     local task = hs.task.new(M.config.curlPath, function(exitCode, stdOut, stdErr)
       os.remove(thisRecordPath)
 
