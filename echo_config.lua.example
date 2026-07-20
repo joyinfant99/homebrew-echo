@@ -1,0 +1,14 @@
+-- Echo hotkey config — copy this to ~/.hammerspoon/echo_config.lua and fill
+-- in your real values. Kept separate from echo.lua on purpose: echo.lua
+-- gets replaced whenever you update (git pull, or `brew upgrade` once the
+-- Homebrew package exists), but this file never does, so your real apiUrl
+-- and apiKey always survive an update untouched.
+
+return {
+  apiUrl = "https://echo.yourdomain.com", -- your Cloudflare Tunnel hostname
+  apiKey = "REPLACE_ME",
+  -- `which rec` after `brew install sox` — Apple Silicon defaults to
+  -- /opt/homebrew, Intel Macs to /usr/local.
+  soxPath = "/opt/homebrew/bin/rec",
+  curlPath = "/usr/bin/curl",
+}
