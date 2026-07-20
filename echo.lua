@@ -1,6 +1,10 @@
 -- Echo hotkey recorder for Hammerspoon.
 -- Hold the hotkey to record, release to transcribe. Requires `sox`
 -- (brew install sox) for the `rec` command-line recorder.
+--
+-- Installed and kept up to date automatically via Homebrew:
+--   brew tap joyinfant99/echo && brew install echo-hotkey
+-- See mac/README.md for manual setup instead.
 
 local M = {}
 
