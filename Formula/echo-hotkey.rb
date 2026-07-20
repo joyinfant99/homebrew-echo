@@ -2,7 +2,7 @@ class EchoHotkey < Formula
   desc "Echo voice dictation Mac hotkey (Hammerspoon script + auto-updater)"
   homepage "https://github.com/joyinfant99/echo"
   url "https://github.com/joyinfant99/homebrew-echo.git", branch: "main"
-  version "2026.07.20.1"
+  version "2026.07.20.2"
   license "MIT"
   head "https://github.com/joyinfant99/homebrew-echo.git", branch: "main"
 
@@ -41,42 +41,19 @@ class EchoHotkey < Formula
       sleep 1
     end
     system "open", "-a", "Hammerspoon"
-
-    install_updater_launch_agent
   end
 
-  def install_updater_launch_agent
-    agents_dir = Pathname.new(Dir.home)/"Library/LaunchAgents"
-    agents_dir.mkpath
-    plist_path = agents_dir/"com.echo.updater.plist"
-
-    plist_path.write <<~EOS
-      <?xml version="1.0" encoding="UTF-8"?>
-      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-      <plist version="1.0">
-      <dict>
-        <key>Label</key>
-        <string>com.echo.updater</string>
-        <key>ProgramArguments</key>
-        <array>
-          <string>/bin/bash</string>
-          <string>-c</string>
-          <string>#{HOMEBREW_PREFIX}/bin/brew update &amp;&amp; #{HOMEBREW_PREFIX}/bin/brew upgrade echo-hotkey</string>
-        </array>
-        <key>StartInterval</key>
-        <integer>21600</integer>
-        <key>RunAtLoad</key>
-        <false/>
-        <key>StandardOutPath</key>
-        <string>#{Dir.home}/Library/Logs/echo-updater.log</string>
-        <key>StandardErrorPath</key>
-        <string>#{Dir.home}/Library/Logs/echo-updater.log</string>
-      </dict>
-      </plist>
-    EOS
-
-    quiet_system "launchctl", "unload", plist_path.to_s
-    system "launchctl", "load", plist_path.to_s
+  # Homebrew's own service mechanism, not a hand-written plist: writing
+  # directly to ~/Library/LaunchAgents from inside post_install gets
+  # silently redirected by Homebrew's install sandbox (confirmed empirically
+  # — the file never reaches the real path). `brew services` runs outside
+  # that sandbox and is the supported way to register a periodic LaunchAgent.
+  service do
+    run ["/bin/bash", "-c", "#{HOMEBREW_PREFIX}/bin/brew update && #{HOMEBREW_PREFIX}/bin/brew upgrade echo-hotkey"]
+    run_type :interval
+    interval 21600
+    log_path (var/"log/echo-updater.log").to_s
+    error_log_path (var/"log/echo-updater.log").to_s
   end
 
   def caveats
@@ -88,10 +65,12 @@ class EchoHotkey < Formula
            macOS prompts (System Settings -> Privacy & Security) -- this
            happens on your first recording, not on install.
         3. System Settings -> Keyboard -> "Press Fn key to" -> Do Nothing.
+        4. Run `brew services start echo-hotkey` once, to turn on
+           automatic background updates (checks every 6 hours).
 
       After that: hold Fn anywhere, speak, release. Updates apply
-      themselves automatically in the background every 6 hours via a
-      LaunchAgent -- you should never need to run `brew upgrade` by hand.
+      themselves automatically in the background -- you should never need
+      to run `brew upgrade` by hand again.
     EOS
   end
 
