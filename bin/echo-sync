@@ -1,0 +1,41 @@
+#!/bin/bash
+# Runs periodically via `brew services` (launchd), deliberately NOT from
+# Homebrew's own install/post_install hooks: those run inside Homebrew's
+# build sandbox, which silently blocks writes to anywhere under $HOME
+# (confirmed empirically — a plain marker-file write from post_install
+# never reached the real ~/.hammerspoon, no error, just silently redirected
+# somewhere else). Anything invoked by launchd has no such restriction, so
+# all of the actual "update the formula, then sync files into place" work
+# happens here instead.
+set -e
+
+BREW="$(command -v brew || echo /opt/homebrew/bin/brew)"
+
+"$BREW" update
+"$BREW" upgrade echo-hotkey || true
+
+FORMULA_PREFIX="$("$BREW" --prefix echo-hotkey)"
+HAMMERSPOON_DIR="$HOME/.hammerspoon"
+mkdir -p "$HAMMERSPOON_DIR"
+
+cp "$FORMULA_PREFIX/echo.lua" "$HAMMERSPOON_DIR/echo.lua"
+
+# Never overwrite an existing config — only seed it once, on first run.
+if [ ! -f "$HAMMERSPOON_DIR/echo_config.lua" ]; then
+  cp "$FORMULA_PREFIX/echo_config.lua.example" "$HAMMERSPOON_DIR/echo_config.lua"
+fi
+
+touch "$HAMMERSPOON_DIR/init.lua"
+if ! grep -q 'require("echo")' "$HAMMERSPOON_DIR/init.lua"; then
+  echo 'require("echo").start()' >> "$HAMMERSPOON_DIR/init.lua"
+fi
+
+if [ ! -d "/Applications/Hammerspoon.app" ]; then
+  "$BREW" install --cask hammerspoon
+fi
+
+if pgrep -q Hammerspoon; then
+  osascript -e 'tell application "Hammerspoon" to quit'
+  sleep 1
+fi
+open -a Hammerspoon
