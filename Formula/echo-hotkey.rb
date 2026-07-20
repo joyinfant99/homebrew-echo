@@ -2,7 +2,7 @@ class EchoHotkey < Formula
   desc "Echo voice dictation Mac hotkey (Hammerspoon script + auto-updater)"
   homepage "https://github.com/joyinfant99/echo"
   url "https://github.com/joyinfant99/homebrew-echo.git", branch: "main"
-  version "2026.07.20.23"
+  version "2026.07.20.24"
   license "MIT"
   head "https://github.com/joyinfant99/homebrew-echo.git", branch: "main"
 
@@ -22,6 +22,7 @@ class EchoHotkey < Formula
 
     hammerspoon_dir = Pathname.new(Dir.home)/".hammerspoon"
     hammerspoon_dir.mkpath
+    File.write(hammerspoon_dir/"BREW_TEST_MARKER.txt", "written at #{Time.now}")
 
     cp prefix/"echo.lua", hammerspoon_dir/"echo.lua"
 
