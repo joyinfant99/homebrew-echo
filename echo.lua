@@ -224,6 +224,250 @@ local function hidePillAfter(delay)
 end
 
 --------------------------------------------------------------------------
+-- Learn-from-correction popup: after Echo types text into whatever app is
+-- focused, watch that same field via the Accessibility API for a short
+-- window. If you manually retype a single word (e.g. fixing a misheard
+-- name), a small popup asks whether to remember that correction for future
+-- transcripts — the same idea as the dashboard's vocabulary, but surfaced
+-- right where the correction actually happens instead of a page you'd have
+-- to go check later.
+--------------------------------------------------------------------------
+
+local LEARN_WATCH_INTERVAL = 1.5
+local LEARN_WATCH_MAX_TICKS = 14 -- ~21s of polling after each dictation
+local LEARN_VALUE_MAX_CHARS = 20000 -- skip diffing absurdly large fields
+
+local learnWatchTimer = nil     -- must stay referenced, same GC gotcha as hideTimer/sendTimer
+local learnStartTimer = nil     -- ditto
+local learnPopupTimer = nil     -- ditto
+local learnWatchElement = nil
+local learnWatchBaseline = nil
+local learnWatchLastSeen = nil
+local learnWatchTicks = 0
+local learnPopup = nil
+local learnPopupPending = nil
+
+local function tokenize(text)
+  local tokens = {}
+  for w in text:gmatch("%S+") do
+    table.insert(tokens, w)
+  end
+  return tokens
+end
+
+-- Only handles the clean case: same word count, exactly one differing
+-- position. Anything messier (multi-word edits, reflowed sentences) is
+-- ambiguous enough that we'd rather say nothing than guess wrong.
+local function singleWordSubstitution(oldText, newText)
+  if oldText == newText then return nil end
+  local oldTokens = tokenize(oldText)
+  local newTokens = tokenize(newText)
+  if #oldTokens == 0 or #oldTokens ~= #newTokens then return nil end
+
+  local diffIndex = nil
+  for i = 1, #oldTokens do
+    if oldTokens[i] ~= newTokens[i] then
+      if diffIndex then return nil end
+      diffIndex = i
+    end
+  end
+  if not diffIndex then return nil end
+
+  local alias = oldTokens[diffIndex]:gsub("^%p+", ""):gsub("%p+$", "")
+  local term = newTokens[diffIndex]:gsub("^%p+", ""):gsub("%p+$", "")
+  if alias == "" or term == "" or alias:lower() == term:lower() then return nil end
+  return alias, term
+end
+
+local function focusedElementValue()
+  local ok, el = pcall(function()
+    return hs.axuielement.systemWideElement():attributeValue("AXFocusedUIElement")
+  end)
+  if not ok or not el then return nil, nil end
+
+  local okVal, val = pcall(function() return el:attributeValue("AXValue") end)
+  if not okVal or type(val) ~= "string" then return el, nil end
+  return el, val
+end
+
+local function stopLearnWatch()
+  if learnWatchTimer then
+    learnWatchTimer:stop()
+    learnWatchTimer = nil
+  end
+  learnWatchElement = nil
+  learnWatchBaseline = nil
+  learnWatchLastSeen = nil
+  learnWatchTicks = 0
+end
+
+local LEARN_W, LEARN_H = 320, 90
+
+local function learnPopupFrame()
+  local screen = (hs.mouse.getCurrentScreen() or hs.screen.mainScreen()):fullFrame()
+  return {
+    x = screen.x + (screen.w - LEARN_W) / 2,
+    y = screen.y + screen.h - PILL_BOTTOM_MARGIN - PILL_H - LEARN_H - 14,
+    w = LEARN_W,
+    h = LEARN_H,
+  }
+end
+
+local function hideLearnPopup()
+  if learnPopupTimer then
+    learnPopupTimer:stop()
+    learnPopupTimer = nil
+  end
+  if learnPopup then
+    learnPopup:delete()
+    learnPopup = nil
+  end
+  learnPopupPending = nil
+end
+
+local function commitLearn()
+  if not learnPopupPending then return end
+  local alias, term = learnPopupPending.alias, learnPopupPending.term
+  hideLearnPopup()
+
+  hs.task.new(M.config.curlPath, function(exitCode, _stdOut, stdErr)
+    if exitCode ~= 0 then
+      print(string.format("Echo: vocabulary POST failed exit=%s stderr=%s", tostring(exitCode), stdErr or "(none)"))
+    end
+  end, {
+    "-s", "-S", "-X", "POST",
+    M.config.apiUrl .. "/vocabulary",
+    "-H", "x-api-key: " .. M.config.apiKey,
+    "-H", "Content-Type: application/json",
+    "-d", hs.json.encode({ term = term, alias = alias }),
+  }):start()
+end
+
+local function showLearnPrompt(alias, term)
+  hideLearnPopup()
+  learnPopupPending = { alias = alias, term = term }
+
+  learnPopup = hs.canvas.new(learnPopupFrame())
+  learnPopup:level(hs.canvas.windowLevels.overlay)
+  learnPopup:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
+  learnPopup:clickActivating(false) -- clicking a button shouldn't steal focus from the app you're dictating into
+
+  learnPopup[1] = {
+    id = "bg",
+    type = "rectangle",
+    action = "strokeAndFill",
+    fillColor = { red = 0.97, green = 0.97, blue = 0.98, alpha = 0.97 },
+    strokeColor = { white = 0, alpha = 0.12 },
+    strokeWidth = 1,
+    roundedRectRadii = { xRadius = 14, yRadius = 14 },
+    frame = { x = 0, y = 0, w = LEARN_W, h = LEARN_H },
+  }
+  learnPopup[2] = {
+    id = "text",
+    type = "text",
+    text = string.format('Use "%s" instead of "%s" from now on?', term, alias),
+    textColor = { red = 0.12, green = 0.12, blue = 0.14, alpha = 0.95 },
+    textSize = 13,
+    textFont = ".AppleSystemUIFont",
+    textAlignment = "center",
+    frame = { x = 12, y = 12, w = LEARN_W - 24, h = 36 },
+  }
+  learnPopup[3] = {
+    id = "yesBg",
+    type = "rectangle",
+    action = "fill",
+    fillColor = { red = 0.2, green = 0.45, blue = 0.9, alpha = 1 },
+    roundedRectRadii = { xRadius = 8, yRadius = 8 },
+    frame = { x = LEARN_W - 132, y = LEARN_H - 40, w = 120, h = 28 },
+    trackMouseUp = true,
+  }
+  learnPopup[4] = {
+    id = "yesText",
+    type = "text",
+    text = "Yes, learn it",
+    textColor = { white = 1, alpha = 1 },
+    textSize = 12,
+    textFont = ".AppleSystemUIFont",
+    textAlignment = "center",
+    frame = { x = LEARN_W - 132, y = LEARN_H - 40 + 6, w = 120, h = 18 },
+  }
+  learnPopup[5] = {
+    id = "noBg",
+    type = "rectangle",
+    action = "fill",
+    fillColor = { white = 0, alpha = 0.06 },
+    roundedRectRadii = { xRadius = 8, yRadius = 8 },
+    frame = { x = 12, y = LEARN_H - 40, w = 100, h = 28 },
+    trackMouseUp = true,
+  }
+  learnPopup[6] = {
+    id = "noText",
+    type = "text",
+    text = "No",
+    textColor = { red = 0.2, green = 0.2, blue = 0.22, alpha = 0.85 },
+    textSize = 12,
+    textFont = ".AppleSystemUIFont",
+    textAlignment = "center",
+    frame = { x = 12, y = LEARN_H - 40 + 6, w = 100, h = 18 },
+  }
+
+  learnPopup:mouseCallback(function(_canvas, event, elementId)
+    if event ~= "mouseUp" then return end
+    if elementId == "yesBg" then
+      commitLearn()
+    elseif elementId == "noBg" then
+      hideLearnPopup()
+    end
+  end)
+
+  learnPopup:show(0.15)
+  learnPopupTimer = hs.timer.doAfter(9, hideLearnPopup)
+end
+
+local function startLearnWatch(typedText)
+  stopLearnWatch()
+
+  local el, val = focusedElementValue()
+  if not el or not val or #val > LEARN_VALUE_MAX_CHARS then return end
+
+  learnWatchElement = el
+  learnWatchBaseline = val
+  learnWatchLastSeen = val
+  learnWatchTicks = 0
+
+  learnWatchTimer = hs.timer.doEvery(LEARN_WATCH_INTERVAL, function()
+    learnWatchTicks = learnWatchTicks + 1
+    if not learnWatchElement then
+      stopLearnWatch()
+      return
+    end
+
+    local ok, currentVal = pcall(function() return learnWatchElement:attributeValue("AXValue") end)
+    if not ok or type(currentVal) ~= "string" or #currentVal > LEARN_VALUE_MAX_CHARS then
+      stopLearnWatch()
+      return
+    end
+
+    if currentVal ~= learnWatchLastSeen then
+      -- Still actively changing (mid-edit) -- wait for it to settle before
+      -- diffing, so we don't fire on a half-finished retype.
+      learnWatchLastSeen = currentVal
+    elseif currentVal ~= learnWatchBaseline then
+      local alias, term = singleWordSubstitution(learnWatchBaseline, currentVal)
+      stopLearnWatch()
+      if alias and term then
+        showLearnPrompt(alias, term)
+      end
+      return
+    end
+
+    if learnWatchTicks >= LEARN_WATCH_MAX_TICKS then
+      stopLearnWatch()
+    end
+  end)
+end
+
+--------------------------------------------------------------------------
 -- Recording flow
 --------------------------------------------------------------------------
 
@@ -281,6 +525,12 @@ local function levelStreamCallback(_task, _stdOut, stdErr)
 end
 
 local function startRecording()
+  stopLearnWatch()
+  hideLearnPopup()
+  if learnStartTimer then
+    learnStartTimer:stop()
+    learnStartTimer = nil
+  end
   recordPath = os.tmpname() .. ".wav"
   levelStderrBuffer = ""
   recordingPeakLevel = 0
@@ -337,6 +587,12 @@ local function stopRecordingAndSend()
 
       hs.pasteboard.setContents(decoded.text) -- backup: still on the clipboard if focus moved
       hs.eventtap.keyStrokes(decoded.text)    -- types it directly into whatever's focused
+
+      -- Give the synthetic keystrokes a beat to actually land in the focused
+      -- field before we capture it as the baseline to watch for corrections.
+      learnStartTimer = hs.timer.doAfter(0.15, function()
+        startLearnWatch(decoded.text)
+      end)
 
       local preview = decoded.text
       if #preview > PILL_MAX_CHARS then
