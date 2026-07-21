@@ -370,21 +370,21 @@ end
 local fnPressed = false
 local fnWatcher = nil
 
+-- Reverted: consuming (returning true from) the Fn press/release edges was
+-- meant to stop macOS's own Fn behavior from firing alongside ours, but it
+-- broke the hotkey outright on every machine, never actually verified with
+-- a real key press before shipping. Always return false here and rely
+-- solely on System Settings -> Keyboard -> "Press Fn key to" -> Do Nothing
+-- to prevent macOS's own Fn behavior instead.
 local function handleFlagsChanged(event)
   local isFnDown = event:getFlags().fn or false
 
   if isFnDown and not fnPressed then
     fnPressed = true
     startRecording()
-    -- Swallow this specific edge so macOS's own Fn behavior (input source
-    -- switch, Emoji picker, Dictation — whatever "Press Fn key to" is set
-    -- to) never fires alongside ours. Every other modifier flagsChanged
-    -- event still falls through to the `return false` below untouched.
-    return true
   elseif not isFnDown and fnPressed then
     fnPressed = false
     stopRecordingAndSend()
-    return true
   end
 
   return false
