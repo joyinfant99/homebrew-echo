@@ -225,25 +225,20 @@ end
 
 --------------------------------------------------------------------------
 -- Learn-from-correction popup: after Echo types text into whatever app is
--- focused, watch that same field via the Accessibility API for a short
--- window. If you manually retype a single word (e.g. fixing a misheard
--- name), a small popup asks whether to remember that correction for future
--- transcripts — the same idea as the dashboard's vocabulary, but surfaced
--- right where the correction actually happens instead of a page you'd have
--- to go check later.
+-- focused, watch your literal keystrokes for a short window afterward. If
+-- you manually retype a single word (e.g. fixing a misheard name), a small
+-- popup asks whether to remember that correction for future transcripts.
+--
+-- This used to work by reading the focused field back via the Accessibility
+-- API, but real testing (TextEdit/Notes/Mail work, Claude desktop/Chrome/
+-- Slack all do not) showed that rich-text composers in Chromium/Electron
+-- apps don't reliably expose their content that way, no matter how the API
+-- is queried (confirmed even with the AXManualAccessibility force-on trick).
+-- Watching keystrokes instead works identically in every app, since it
+-- never depends on what the destination app chooses to expose.
 --------------------------------------------------------------------------
 
-local LEARN_WATCH_INTERVAL = 1.5
-local LEARN_WATCH_MAX_TICKS = 14 -- ~21s of polling after each dictation
-local LEARN_VALUE_MAX_CHARS = 20000 -- skip diffing absurdly large fields
-
-local learnWatchTimer = nil     -- must stay referenced, same GC gotcha as hideTimer/sendTimer
-local learnStartTimer = nil     -- ditto
-local learnPopupTimer = nil     -- ditto
-local learnWatchElement = nil
-local learnWatchBaseline = nil
-local learnWatchLastSeen = nil
-local learnWatchTicks = 0
+local learnPopupTimer = nil     -- must stay referenced, same GC gotcha as hideTimer/sendTimer
 local learnPopup = nil
 local learnPopupPending = nil
 
@@ -277,28 +272,6 @@ local function singleWordSubstitution(oldText, newText)
   local term = newTokens[diffIndex]:gsub("^%p+", ""):gsub("%p+$", "")
   if alias == "" or term == "" or alias:lower() == term:lower() then return nil end
   return alias, term
-end
-
-local function focusedElementValue()
-  local ok, el = pcall(function()
-    return hs.axuielement.systemWideElement():attributeValue("AXFocusedUIElement")
-  end)
-  if not ok or not el then return nil, nil end
-
-  local okVal, val = pcall(function() return el:attributeValue("AXValue") end)
-  if not okVal or type(val) ~= "string" then return el, nil end
-  return el, val
-end
-
-local function stopLearnWatch()
-  if learnWatchTimer then
-    learnWatchTimer:stop()
-    learnWatchTimer = nil
-  end
-  learnWatchElement = nil
-  learnWatchBaseline = nil
-  learnWatchLastSeen = nil
-  learnWatchTicks = 0
 end
 
 local LEARN_W, LEARN_H = 320, 90
@@ -424,46 +397,123 @@ local function showLearnPrompt(alias, term)
   learnPopupTimer = hs.timer.doAfter(9, hideLearnPopup)
 end
 
+-- Keystroke-based watch: reconstructs edits locally from Backspace/typing
+-- events instead of reading any app's state. Only the clean case is
+-- tracked (plain Backspace + plain character keys); anything that breaks
+-- the "cursor stayed right after what we typed" assumption (arrows, Cmd
+-- shortcuts, switching apps) ends the watch rather than risk a wrong diff.
+local KEYSTROKE_WATCH_MAX_SECONDS = 25
+
+local keystrokeWatchTap = nil     -- must stay referenced, same GC gotcha as hideTimer/sendTimer
+local keystrokeWatchTimeout = nil -- ditto
+local keystrokeOriginalText = nil
+local keystrokeShadowText = nil
+local keystrokeShadowPos = nil
+local keystrokeWatchAppPid = nil
+
+local DELETE_KEYCODE = hs.keycodes.map["delete"] or 51
+local RETURN_KEYCODE = hs.keycodes.map["return"] or 36
+local TAB_KEYCODE = hs.keycodes.map["tab"] or 48
+
+-- Keys that invalidate our "cursor is still right where we left it"
+-- assumption: arrows, escape, forward-delete, home/end/page up/down.
+local ABORT_KEYCODES = {
+  [53] = true, [123] = true, [124] = true, [125] = true, [126] = true,
+  [115] = true, [119] = true, [116] = true, [121] = true, [117] = true,
+}
+
+local function finishKeystrokeWatch(shouldDiff)
+  if keystrokeWatchTap then
+    keystrokeWatchTap:stop()
+    keystrokeWatchTap = nil
+  end
+  if keystrokeWatchTimeout then
+    keystrokeWatchTimeout:stop()
+    keystrokeWatchTimeout = nil
+  end
+  if shouldDiff and keystrokeOriginalText and keystrokeShadowText
+     and keystrokeOriginalText ~= keystrokeShadowText then
+    local alias, term = singleWordSubstitution(keystrokeOriginalText, keystrokeShadowText)
+    if alias and term then
+      showLearnPrompt(alias, term)
+    end
+  end
+  keystrokeOriginalText = nil
+  keystrokeShadowText = nil
+  keystrokeShadowPos = nil
+  keystrokeWatchAppPid = nil
+end
+
 local function startLearnWatch(typedText)
-  stopLearnWatch()
+  finishKeystrokeWatch(false)
 
-  local el, val = focusedElementValue()
-  if not el or not val or #val > LEARN_VALUE_MAX_CHARS then return end
+  keystrokeOriginalText = typedText
+  keystrokeShadowText = typedText
+  keystrokeShadowPos = #typedText
+  local app = hs.application.frontmostApplication()
+  keystrokeWatchAppPid = app and app:pid() or nil
 
-  learnWatchElement = el
-  learnWatchBaseline = val
-  learnWatchLastSeen = val
-  learnWatchTicks = 0
-
-  learnWatchTimer = hs.timer.doEvery(LEARN_WATCH_INTERVAL, function()
-    learnWatchTicks = learnWatchTicks + 1
-    if not learnWatchElement then
-      stopLearnWatch()
-      return
+  keystrokeWatchTap = hs.eventtap.new({
+    hs.eventtap.event.types.keyDown,
+    hs.eventtap.event.types.leftMouseDown,
+    hs.eventtap.event.types.rightMouseDown,
+  }, function(event)
+    -- A mouse click almost always means repositioning the cursor (e.g.
+    -- double-clicking a word to select and retype it) -- exactly how most
+    -- real corrections happen, and something we have no way to track from
+    -- key events alone. Safer to go silent than splice a correction into
+    -- the wrong place in our local reconstruction.
+    if event:getType() ~= hs.eventtap.event.types.keyDown then
+      finishKeystrokeWatch(false)
+      return false
     end
 
-    local ok, currentVal = pcall(function() return learnWatchElement:attributeValue("AXValue") end)
-    if not ok or type(currentVal) ~= "string" or #currentVal > LEARN_VALUE_MAX_CHARS then
-      stopLearnWatch()
-      return
+    local app = hs.application.frontmostApplication()
+    if not app or app:pid() ~= keystrokeWatchAppPid then
+      finishKeystrokeWatch(true)
+      return false
     end
 
-    if currentVal ~= learnWatchLastSeen then
-      -- Still actively changing (mid-edit) -- wait for it to settle before
-      -- diffing, so we don't fire on a half-finished retype.
-      learnWatchLastSeen = currentVal
-    elseif currentVal ~= learnWatchBaseline then
-      local alias, term = singleWordSubstitution(learnWatchBaseline, currentVal)
-      stopLearnWatch()
-      if alias and term then
-        showLearnPrompt(alias, term)
+    local keyCode = event:getKeyCode()
+    local flags = event:getFlags()
+
+    if flags.cmd or flags.ctrl or flags.fn then
+      finishKeystrokeWatch(true)
+      return false
+    end
+
+    if keyCode == RETURN_KEYCODE or keyCode == TAB_KEYCODE then
+      finishKeystrokeWatch(true)
+      return false
+    end
+
+    if ABORT_KEYCODES[keyCode] then
+      finishKeystrokeWatch(false)
+      return false
+    end
+
+    if keyCode == DELETE_KEYCODE then
+      if keystrokeShadowPos > 0 then
+        keystrokeShadowText = keystrokeShadowText:sub(1, keystrokeShadowPos - 1) ..
+                               keystrokeShadowText:sub(keystrokeShadowPos + 1)
+        keystrokeShadowPos = keystrokeShadowPos - 1
       end
-      return
+      return false
     end
 
-    if learnWatchTicks >= LEARN_WATCH_MAX_TICKS then
-      stopLearnWatch()
+    local chars = event:getCharacters()
+    if chars and #chars > 0 and chars:match("^[%g%s]+$") then
+      keystrokeShadowText = keystrokeShadowText:sub(1, keystrokeShadowPos) .. chars ..
+                             keystrokeShadowText:sub(keystrokeShadowPos + 1)
+      keystrokeShadowPos = keystrokeShadowPos + #chars
     end
+
+    return false
+  end)
+  keystrokeWatchTap:start()
+
+  keystrokeWatchTimeout = hs.timer.doAfter(KEYSTROKE_WATCH_MAX_SECONDS, function()
+    finishKeystrokeWatch(true)
   end)
 end
 
@@ -525,12 +575,8 @@ local function levelStreamCallback(_task, _stdOut, stdErr)
 end
 
 local function startRecording()
-  stopLearnWatch()
+  finishKeystrokeWatch(false)
   hideLearnPopup()
-  if learnStartTimer then
-    learnStartTimer:stop()
-    learnStartTimer = nil
-  end
   recordPath = os.tmpname() .. ".wav"
   levelStderrBuffer = ""
   recordingPeakLevel = 0
@@ -588,11 +634,10 @@ local function stopRecordingAndSend()
       hs.pasteboard.setContents(decoded.text) -- backup: still on the clipboard if focus moved
       hs.eventtap.keyStrokes(decoded.text)    -- types it directly into whatever's focused
 
-      -- Give the synthetic keystrokes a beat to actually land in the focused
-      -- field before we capture it as the baseline to watch for corrections.
-      learnStartTimer = hs.timer.doAfter(0.15, function()
-        startLearnWatch(decoded.text)
-      end)
+      -- keyStrokes() is synchronous, so starting the keystroke watch here
+      -- (rather than after a delay, like the old AX-based version needed)
+      -- can't pick up its own synthetic keys.
+      startLearnWatch(decoded.text)
 
       local preview = decoded.text
       if #preview > PILL_MAX_CHARS then
