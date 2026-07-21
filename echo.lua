@@ -20,18 +20,24 @@ M.config = require("echo_config")
 -- transcribing, and a brief confirmation before fading out.
 --------------------------------------------------------------------------
 
-local PILL_W, PILL_H = 220, 44
-local PILL_BOTTOM_MARGIN = 80
-local PILL_MAX_CHARS = 30
+local PILL_W, PILL_H = 168, 34
+local PILL_BOTTOM_MARGIN = 28 -- lower/closer to the screen edge, out of the way of text boxes
+local PILL_MAX_CHARS = 20
+local PILL_RADIUS = PILL_H / 2
+
+-- The canvas window itself has to be bigger than the visible pill so the
+-- layered shadow below has room to bleed outward without being clipped at
+-- the canvas edge.
+local SHADOW_PAD = 10
 
 local BAR_COUNT = 5
-local BAR_WIDTH = 3
-local BAR_GAP = 4
-local BAR_MIN_H = 4
-local BAR_MAX_H = 20
-local BARS_X = 20 -- left inset where the waveform starts
+local BAR_WIDTH = 2.5
+local BAR_GAP = 3
+local BAR_MIN_H = 3
+local BAR_MAX_H = 15
+local BARS_X = 12 -- left inset (within the pill itself) where the waveform starts
 
-local LABEL_X = BARS_X + (BAR_COUNT * BAR_WIDTH) + ((BAR_COUNT - 1) * BAR_GAP) + 12
+local LABEL_X = BARS_X + (BAR_COUNT * BAR_WIDTH) + ((BAR_COUNT - 1) * BAR_GAP) + 10
 
 local pill = nil
 local pulseTimer = nil
@@ -47,17 +53,17 @@ local micLevelSmoothed = 0
 local function pillFrame()
   local screen = (hs.mouse.getCurrentScreen() or hs.screen.mainScreen()):fullFrame()
   return {
-    x = screen.x + (screen.w - PILL_W) / 2,
-    y = screen.y + screen.h - PILL_BOTTOM_MARGIN - PILL_H,
-    w = PILL_W,
-    h = PILL_H,
+    x = screen.x + (screen.w - PILL_W) / 2 - SHADOW_PAD,
+    y = screen.y + screen.h - PILL_BOTTOM_MARGIN - PILL_H - SHADOW_PAD,
+    w = PILL_W + SHADOW_PAD * 2,
+    h = PILL_H + SHADOW_PAD * 2,
   }
 end
 
 local function barFrame(i, h)
   return {
-    x = BARS_X + (i - 1) * (BAR_WIDTH + BAR_GAP),
-    y = (PILL_H - h) / 2,
+    x = SHADOW_PAD + BARS_X + (i - 1) * (BAR_WIDTH + BAR_GAP),
+    y = SHADOW_PAD + (PILL_H - h) / 2,
     w = BAR_WIDTH,
     h = h,
   }
@@ -70,50 +76,90 @@ local function ensurePill()
   pill:level(hs.canvas.windowLevels.overlay)
   pill:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
 
-  -- Frosted apple-glass look: translucent light grey fill, a soft white
-  -- edge highlight. No drop shadow — hs.canvas renders element shadows
-  -- against the bounding box rather than the rounded path, which spills a
-  -- faint rectangular halo past the curved corners on light backgrounds.
+  -- A soft, layered shadow instead of hs.canvas's own per-element shadow
+  -- property, which renders against the bounding box rather than the
+  -- rounded path and spills a rectangular halo past the curved corners on
+  -- light backgrounds (confirmed empirically). Three progressively larger,
+  -- more transparent, further-offset rounded rects fake a soft drop shadow
+  -- that still follows the pill's own curve.
   pill[1] = {
+    id = "shadow3",
+    type = "rectangle",
+    action = "fill",
+    fillColor = { white = 0, alpha = 0.05 },
+    roundedRectRadii = { xRadius = PILL_RADIUS + 3, yRadius = PILL_RADIUS + 3 },
+    frame = { x = SHADOW_PAD - 4, y = SHADOW_PAD + 5, w = PILL_W + 8, h = PILL_H },
+  }
+  pill[2] = {
+    id = "shadow2",
+    type = "rectangle",
+    action = "fill",
+    fillColor = { white = 0, alpha = 0.08 },
+    roundedRectRadii = { xRadius = PILL_RADIUS + 1, yRadius = PILL_RADIUS + 1 },
+    frame = { x = SHADOW_PAD - 2, y = SHADOW_PAD + 3, w = PILL_W + 4, h = PILL_H },
+  }
+  pill[3] = {
+    id = "shadow1",
+    type = "rectangle",
+    action = "fill",
+    fillColor = { white = 0, alpha = 0.13 },
+    roundedRectRadii = { xRadius = PILL_RADIUS, yRadius = PILL_RADIUS },
+    frame = { x = SHADOW_PAD, y = SHADOW_PAD + 1.5, w = PILL_W, h = PILL_H },
+  }
+
+  -- Frosted apple-glass body: a subtle top-to-bottom gradient (rather than
+  -- a flat fill) for a bit of dimensionality, plus a cool greyish border
+  -- for definition instead of a flat white edge.
+  pill[4] = {
     id = "bg",
     type = "rectangle",
     action = "strokeAndFill",
-    fillColor = { red = 0.93, green = 0.93, blue = 0.95, alpha = 0.55 },
-    strokeColor = { white = 1, alpha = 0.55 },
+    fillGradient = "linear",
+    fillGradientColors = {
+      { red = 1, green = 1, blue = 1, alpha = 0.68 },
+      { red = 0.85, green = 0.85, blue = 0.88, alpha = 0.46 },
+    },
+    fillGradientAngle = 90,
+    strokeColor = { red = 0.6, green = 0.61, blue = 0.64, alpha = 0.5 },
     strokeWidth = 1,
-    roundedRectRadii = { xRadius = PILL_H / 2, yRadius = PILL_H / 2 },
-    frame = { x = 0, y = 0, w = PILL_W, h = PILL_H },
+    roundedRectRadii = { xRadius = PILL_RADIUS, yRadius = PILL_RADIUS },
+    frame = { x = SHADOW_PAD, y = SHADOW_PAD, w = PILL_W, h = PILL_H },
   }
 
   for i = 1, BAR_COUNT do
-    pill[1 + i] = {
+    pill[4 + i] = {
       id = "bar" .. i,
       type = "rectangle",
       action = "fill",
       fillColor = { red = 0.85, green = 0.25, blue = 0.25, alpha = 0 }, -- hidden by default
-      roundedRectRadii = { xRadius = 1.5, yRadius = 1.5 },
+      roundedRectRadii = { xRadius = 1.25, yRadius = 1.25 },
       frame = barFrame(i, BAR_MIN_H),
     }
   end
 
-  pill[2 + BAR_COUNT] = {
+  pill[5 + BAR_COUNT] = {
     id = "dot",
     type = "circle",
     action = "fill",
     fillColor = { red = 0.9, green = 0.25, blue = 0.25, alpha = 0 }, -- hidden by default
-    center = { x = BARS_X + 6, y = PILL_H / 2 },
-    radius = 6,
+    center = { x = SHADOW_PAD + BARS_X + 4.5, y = SHADOW_PAD + PILL_H / 2 },
+    radius = 4.5,
   }
 
-  pill[3 + BAR_COUNT] = {
+  pill[6 + BAR_COUNT] = {
     id = "label",
     type = "text",
     text = "",
     textColor = { red = 0.12, green = 0.12, blue = 0.14, alpha = 0.9 },
-    textSize = 14,
+    textSize = 12.5,
     textFont = ".AppleSystemUIFont",
     textAlignment = "left",
-    frame = { x = LABEL_X, y = (PILL_H - 18) / 2, w = PILL_W - LABEL_X - 16, h = 20 },
+    frame = {
+      x = SHADOW_PAD + LABEL_X,
+      y = SHADOW_PAD + (PILL_H - 16) / 2,
+      w = PILL_W - LABEL_X - 14,
+      h = 16,
+    },
   }
 end
 
@@ -162,15 +208,18 @@ local function startBars(color)
   for i = 1, BAR_COUNT do
     pill["bar" .. i].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.9 }
   end
-  barTimer = hs.timer.doEvery(0.045, function()
-    barPhase = barPhase + 0.22
+  barTimer = hs.timer.doEvery(0.03, function()
+    barPhase = barPhase + 0.26
     -- ease toward the latest parsed level so sox's ~8-10Hz updates don't
-    -- look like discrete jumps at our ~22Hz render rate
-    micLevelSmoothed = micLevelSmoothed + (micLevel - micLevelSmoothed) * 0.35
+    -- look like discrete jumps at our ~33Hz render rate -- a higher factor
+    -- than before so the bars track real volume changes more tightly
+    micLevelSmoothed = micLevelSmoothed + (micLevel - micLevelSmoothed) * 0.55
     if not pill then return end
     for i = 1, BAR_COUNT do
       local freq = 1 + (i * 0.37)
-      local wobble = 0.85 + 0.15 * math.sin(barPhase * freq + i * 1.3)
+      -- lighter wobble than before: mostly driven by actual mic level, with
+      -- just enough per-bar variation to not look robotic
+      local wobble = 0.92 + 0.08 * math.sin(barPhase * freq + i * 1.3)
       local h = BAR_MIN_H + (BAR_MAX_H - BAR_MIN_H) * micLevelSmoothed * wobble
       h = math.max(BAR_MIN_H, math.min(BAR_MAX_H, h))
       pill["bar" .. i].frame = barFrame(i, h)
