@@ -766,7 +766,7 @@ end
 local function startRecording()
   finishKeystrokeWatch(false)
   hideLearnPopup()
-  hs.sound.getByName("Basso"):play()
+  hs.sound.getByName("Frog"):play()
   recordPath = os.tmpname() .. ".wav"
   levelStderrBuffer = ""
   recordingPeakLevel = 0
