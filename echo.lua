@@ -878,6 +878,12 @@ local function handleFlagsChanged(event)
 end
 
 function M.start()
+  -- Reload Config re-runs this without the process restarting, so a stale
+  -- watcher from the previous load must be stopped first or Fn presses
+  -- fire two+ overlapping recordings/HUDs at once instead of one.
+  if fnWatcher then
+    fnWatcher:stop()
+  end
   fnWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, handleFlagsChanged)
   fnWatcher:start()
 end
