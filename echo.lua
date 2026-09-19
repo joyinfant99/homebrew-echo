@@ -668,10 +668,13 @@ end
 -- This works for native apps (Notes, TextEdit, Mail) but not Chromium/Electron.
 local KEYSTROKE_WATCH_MAX_SECONDS = 25
 local ACCESSIBILITY_CHECK_DELAY = 4  -- seconds after click to check
+local CLIPBOARD_POLL_INTERVAL = 0.5  -- seconds between clipboard checks
 
 local keystrokeWatchTap = nil     -- must stay referenced, same GC gotcha as hideTimer/sendTimer
 local keystrokeWatchTimeout = nil -- ditto
 local accessibilityCheckTimer = nil -- timer for delayed Accessibility API check
+local clipboardWatchTimer = nil   -- timer for polling clipboard changes
+local clipboardLastChangeCount = nil -- to detect clipboard changes
 local keystrokeOriginalText = nil
 local keystrokeShadowText = nil
 local keystrokeShadowPos = nil
@@ -721,7 +724,7 @@ local function checkAccessibilityForCorrections()
   local currentText = tryReadFocusedText()
   if not currentText then
     -- Accessibility didn't work (Chromium/Electron app), give up silently
-    keystrokeOriginalText = nil
+    -- Clipboard watch is still running as fallback
     return
   end
 
@@ -729,13 +732,13 @@ local function checkAccessibilityForCorrections()
   -- The user may have typed more after the correction, so we search for
   -- a modified version of our original text
   local original = keystrokeOriginalText
-  keystrokeOriginalText = nil  -- clear before processing
 
   -- Simple approach: if the current text contains a modified version of
   -- what we typed, try to detect single-word substitutions
   -- This is imperfect but catches common cases like name corrections
   local alias, term = singleWordSubstitution(original, currentText)
   if alias and term then
+    keystrokeOriginalText = nil  -- clear to prevent duplicate detection
     autoLearnCorrection(alias, term)
     return
   end
@@ -745,9 +748,56 @@ local function checkAccessibilityForCorrections()
   if math.abs(#currentText - #original) < #original * 0.5 then
     alias, term = singleWordSubstitution(original, currentText)
     if alias and term then
+      keystrokeOriginalText = nil
       autoLearnCorrection(alias, term)
     end
   end
+end
+
+-- Check clipboard for corrections. Called periodically after Echo types text.
+-- Works in all apps including Chrome — triggered when user copies (Cmd+C).
+local function checkClipboardForCorrections()
+  if not keystrokeOriginalText then return end
+
+  local currentChangeCount = hs.pasteboard.changeCount()
+  if currentChangeCount == clipboardLastChangeCount then
+    return  -- clipboard hasn't changed
+  end
+  clipboardLastChangeCount = currentChangeCount
+
+  local clipboardText = hs.pasteboard.getContents()
+  if not clipboardText or #clipboardText == 0 then return end
+
+  -- Skip if clipboard is exactly what we typed (user just copied without editing)
+  if clipboardText == keystrokeOriginalText then return end
+
+  -- Skip if clipboard is way longer (user copied a whole document)
+  if #clipboardText > #keystrokeOriginalText * 3 then return end
+
+  -- Check for single-word substitution
+  local alias, term = singleWordSubstitution(keystrokeOriginalText, clipboardText)
+  if alias and term then
+    keystrokeOriginalText = nil  -- clear to prevent duplicate detection
+    autoLearnCorrection(alias, term)
+  end
+end
+
+-- Start watching clipboard for corrections (works in Chrome and all apps)
+local function startClipboardWatch()
+  if clipboardWatchTimer then
+    clipboardWatchTimer:stop()
+  end
+  clipboardLastChangeCount = hs.pasteboard.changeCount()
+  clipboardWatchTimer = hs.timer.doEvery(CLIPBOARD_POLL_INTERVAL, checkClipboardForCorrections)
+end
+
+-- Stop watching clipboard
+local function stopClipboardWatch()
+  if clipboardWatchTimer then
+    clipboardWatchTimer:stop()
+    clipboardWatchTimer = nil
+  end
+  clipboardLastChangeCount = nil
 end
 
 local function finishKeystrokeWatch(shouldDiff, switchToAccessibility)
@@ -766,12 +816,12 @@ local function finishKeystrokeWatch(shouldDiff, switchToAccessibility)
 
   if switchToAccessibility and keystrokeOriginalText then
     -- Mouse click detected: switch to accessibility mode
-    -- Keep keystrokeOriginalText for the delayed check
+    -- Keep keystrokeOriginalText for the delayed check (and clipboard watch continues)
     accessibilityCheckTimer = hs.timer.doAfter(ACCESSIBILITY_CHECK_DELAY, checkAccessibilityForCorrections)
     keystrokeShadowText = nil
     keystrokeShadowPos = nil
     keystrokeWatchAppPid = nil
-    return
+    return  -- clipboard watch keeps running
   end
 
   if shouldDiff and keystrokeOriginalText and keystrokeShadowText
@@ -782,6 +832,9 @@ local function finishKeystrokeWatch(shouldDiff, switchToAccessibility)
       autoLearnCorrection(alias, term)
     end
   end
+
+  -- Full cleanup - stop clipboard watch too
+  stopClipboardWatch()
   keystrokeOriginalText = nil
   keystrokeShadowText = nil
   keystrokeShadowPos = nil
@@ -796,6 +849,9 @@ local function startLearnWatch(typedText)
   keystrokeShadowPos = #typedText
   local app = hs.application.frontmostApplication()
   keystrokeWatchAppPid = app and app:pid() or nil
+
+  -- Start clipboard watch (works in Chrome and all apps)
+  startClipboardWatch()
 
   keystrokeWatchTap = hs.eventtap.new({
     hs.eventtap.event.types.keyDown,
@@ -813,7 +869,7 @@ local function startLearnWatch(typedText)
 
     local app = hs.application.frontmostApplication()
     if not app or app:pid() ~= keystrokeWatchAppPid then
-      finishKeystrokeWatch(true)
+      finishKeystrokeWatch(true, false)
       return false
     end
 
@@ -821,17 +877,17 @@ local function startLearnWatch(typedText)
     local flags = event:getFlags()
 
     if flags.cmd or flags.ctrl or flags.fn then
-      finishKeystrokeWatch(true)
+      finishKeystrokeWatch(true, false)
       return false
     end
 
     if keyCode == RETURN_KEYCODE or keyCode == TAB_KEYCODE then
-      finishKeystrokeWatch(true)
+      finishKeystrokeWatch(true, false)
       return false
     end
 
     if ABORT_KEYCODES[keyCode] then
-      finishKeystrokeWatch(false)
+      finishKeystrokeWatch(false, false)
       return false
     end
 
@@ -856,7 +912,7 @@ local function startLearnWatch(typedText)
   keystrokeWatchTap:start()
 
   keystrokeWatchTimeout = hs.timer.doAfter(KEYSTROKE_WATCH_MAX_SECONDS, function()
-    finishKeystrokeWatch(true)
+    finishKeystrokeWatch(true, false)  -- try diff, don't switch to accessibility
   end)
 end
 

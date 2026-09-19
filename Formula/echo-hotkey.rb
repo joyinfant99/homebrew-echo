@@ -2,7 +2,7 @@ class EchoHotkey < Formula
   desc "Echo voice dictation Mac hotkey (Hammerspoon script + auto-updater)"
   homepage "https://github.com/joyinfant99/echo"
   url "https://github.com/joyinfant99/homebrew-echo.git", branch: "main"
-  version "2026.09.19.71"
+  version "2026.09.19.72"
   license "MIT"
   head "https://github.com/joyinfant99/homebrew-echo.git", branch: "main"
 
