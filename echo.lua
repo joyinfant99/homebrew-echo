@@ -661,10 +661,17 @@ end
 -- tracked (plain Backspace + plain character keys); anything that breaks
 -- the "cursor stayed right after what we typed" assumption (arrows, Cmd
 -- shortcuts, switching apps) ends the watch rather than risk a wrong diff.
+--
+-- When a mouse click is detected (e.g. double-click to select), we switch
+-- to "accessibility mode": stop keystroke tracking, wait a few seconds,
+-- then try to read the focused element's content via Accessibility API.
+-- This works for native apps (Notes, TextEdit, Mail) but not Chromium/Electron.
 local KEYSTROKE_WATCH_MAX_SECONDS = 25
+local ACCESSIBILITY_CHECK_DELAY = 4  -- seconds after click to check
 
 local keystrokeWatchTap = nil     -- must stay referenced, same GC gotcha as hideTimer/sendTimer
 local keystrokeWatchTimeout = nil -- ditto
+local accessibilityCheckTimer = nil -- timer for delayed Accessibility API check
 local keystrokeOriginalText = nil
 local keystrokeShadowText = nil
 local keystrokeShadowPos = nil
@@ -681,7 +688,69 @@ local ABORT_KEYCODES = {
   [115] = true, [119] = true, [116] = true, [121] = true, [117] = true,
 }
 
-local function finishKeystrokeWatch(shouldDiff)
+-- Try to read the focused element's text content via Accessibility API.
+-- Works for native macOS apps (Notes, TextEdit, Mail, etc.) but returns
+-- nil for Chromium/Electron apps where the API doesn't expose content.
+local function tryReadFocusedText()
+  local app = hs.application.frontmostApplication()
+  if not app then return nil end
+
+  local elem = hs.axuielement.systemWideElement():attributeValue("AXFocusedUIElement")
+  if not elem then return nil end
+
+  -- Try AXValue first (standard for text fields)
+  local value = elem:attributeValue("AXValue")
+  if type(value) == "string" and #value > 0 then
+    return value
+  end
+
+  -- Some apps use AXSelectedText or the element might be a container
+  local selected = elem:attributeValue("AXSelectedText")
+  if type(selected) == "string" and #selected > 0 then
+    return selected
+  end
+
+  return nil
+end
+
+-- Check for corrections via Accessibility API after a mouse click.
+-- Called after a delay when the user likely finished editing.
+local function checkAccessibilityForCorrections()
+  if not keystrokeOriginalText then return end
+
+  local currentText = tryReadFocusedText()
+  if not currentText then
+    -- Accessibility didn't work (Chromium/Electron app), give up silently
+    keystrokeOriginalText = nil
+    return
+  end
+
+  -- Look for the original text within the current content
+  -- The user may have typed more after the correction, so we search for
+  -- a modified version of our original text
+  local original = keystrokeOriginalText
+  keystrokeOriginalText = nil  -- clear before processing
+
+  -- Simple approach: if the current text contains a modified version of
+  -- what we typed, try to detect single-word substitutions
+  -- This is imperfect but catches common cases like name corrections
+  local alias, term = singleWordSubstitution(original, currentText)
+  if alias and term then
+    autoLearnCorrection(alias, term)
+    return
+  end
+
+  -- If lengths are similar, the edit might be within the same text region
+  -- Try comparing if current text is close in length to original
+  if math.abs(#currentText - #original) < #original * 0.5 then
+    alias, term = singleWordSubstitution(original, currentText)
+    if alias and term then
+      autoLearnCorrection(alias, term)
+    end
+  end
+end
+
+local function finishKeystrokeWatch(shouldDiff, switchToAccessibility)
   if keystrokeWatchTap then
     keystrokeWatchTap:stop()
     keystrokeWatchTap = nil
@@ -690,6 +759,21 @@ local function finishKeystrokeWatch(shouldDiff)
     keystrokeWatchTimeout:stop()
     keystrokeWatchTimeout = nil
   end
+  if accessibilityCheckTimer then
+    accessibilityCheckTimer:stop()
+    accessibilityCheckTimer = nil
+  end
+
+  if switchToAccessibility and keystrokeOriginalText then
+    -- Mouse click detected: switch to accessibility mode
+    -- Keep keystrokeOriginalText for the delayed check
+    accessibilityCheckTimer = hs.timer.doAfter(ACCESSIBILITY_CHECK_DELAY, checkAccessibilityForCorrections)
+    keystrokeShadowText = nil
+    keystrokeShadowPos = nil
+    keystrokeWatchAppPid = nil
+    return
+  end
+
   if shouldDiff and keystrokeOriginalText and keystrokeShadowText
      and keystrokeOriginalText ~= keystrokeShadowText then
     local alias, term = singleWordSubstitution(keystrokeOriginalText, keystrokeShadowText)
@@ -705,7 +789,7 @@ local function finishKeystrokeWatch(shouldDiff)
 end
 
 local function startLearnWatch(typedText)
-  finishKeystrokeWatch(false)
+  finishKeystrokeWatch(false, false)
 
   keystrokeOriginalText = typedText
   keystrokeShadowText = typedText
@@ -718,13 +802,12 @@ local function startLearnWatch(typedText)
     hs.eventtap.event.types.leftMouseDown,
     hs.eventtap.event.types.rightMouseDown,
   }, function(event)
-    -- A mouse click almost always means repositioning the cursor (e.g.
-    -- double-clicking a word to select and retype it) -- exactly how most
-    -- real corrections happen, and something we have no way to track from
-    -- key events alone. Safer to go silent than splice a correction into
-    -- the wrong place in our local reconstruction.
+    -- A mouse click (e.g. double-clicking a word to select and retype it)
+    -- breaks our keystroke-based tracking. Instead of giving up, switch to
+    -- accessibility mode: wait a few seconds then try to read the text via
+    -- Accessibility API to detect corrections. Works for native apps only.
     if event:getType() ~= hs.eventtap.event.types.keyDown then
-      finishKeystrokeWatch(false)
+      finishKeystrokeWatch(false, true)  -- true = switch to accessibility mode
       return false
     end
 
@@ -835,7 +918,7 @@ local function levelStreamCallback(_task, _stdOut, stdErr)
 end
 
 local function startRecording()
-  finishKeystrokeWatch(false)
+  finishKeystrokeWatch(false, false)
   hideLearnPopup()
   hs.sound.getByName("Frog"):play()
   recordPath = os.tmpname() .. ".wav"
