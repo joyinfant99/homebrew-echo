@@ -543,10 +543,18 @@ local function hideLearnPopup()
   learnPopupPending = nil
 end
 
+local COLOR_BLUE = { r = 0.2, g = 0.45, b = 0.9 }
+
 -- Auto-saves a vocabulary correction without requiring user confirmation.
 -- Called automatically when a clear single-word substitution is detected.
+-- Shows a brief HUD notification so the user knows what was learned.
 local function autoLearnCorrection(alias, term)
   print(string.format("Echo: auto-learning '%s' → '%s'", alias, term))
+
+  -- Show what was learned in the HUD
+  showSteady(string.format("Learned: %s → %s", alias, term), COLOR_BLUE)
+  hidePillAfter(2.0)
+
   hs.task.new(M.config.curlPath, function(exitCode, _stdOut, stdErr)
     if exitCode ~= 0 then
       print(string.format("Echo: vocabulary POST failed exit=%s stderr=%s", tostring(exitCode), stdErr or "(none)"))
