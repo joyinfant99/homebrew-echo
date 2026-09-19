@@ -14,71 +14,87 @@ local M = {}
 M.config = require("echo_config")
 
 --------------------------------------------------------------------------
--- Glass orb HUD: a small round liquid-glass indicator pinned near the
+-- Pill HUD with waveform bars: a compact horizontal pill pinned near the
 -- bottom of the screen, replacing Hammerspoon's default centered
--- hs.alert popups. Deliberately not a status bar with text — the point is
--- that each state reads from its motion alone: a flowing wave line while
--- recording, a soft breathing glow while transcribing, a quick expanding
--- ping on success. It only widens into a text capsule for the rare
--- error/info case (no speech detected, a request failing) where a message
--- actually needs to be read. Motion inspired loosely by how Siri signals
--- "listening"/"thinking" state through animation alone, but deliberately
--- monochrome glass rather than a colorful blob, so it doesn't read as a
--- Siri knockoff.
+-- hs.alert popups. Each state reads from its motion alone: 9 vertical
+-- bars bouncing with mic level while recording, bars breathing pink↔violet
+-- while transcribing, a green flash on success. It only widens into a text
+-- capsule for the rare error/info case (no speech detected, a request
+-- failing) where a message actually needs to be read.
 --------------------------------------------------------------------------
 
-local ORB_D = 52 -- diameter of the compact circular orb (recording/processing/success)
+local PILL_W = 120 -- width of the compact pill (recording/processing/success)
+local PILL_H = 36 -- height of the pill
+local PILL_RADIUS = 18 -- half of height for full pill shape
 local WIDE_W = 220 -- width when widened into a capsule to show an error/info message
-local BOTTOM_MARGIN = 30 -- lower/closer to the screen edge, out of the way of text boxes
-local ORB_RADIUS = ORB_D / 2
+local PILL_BOTTOM_MARGIN = 30 -- lower/closer to the screen edge, out of the way of text boxes
 
--- The canvas window itself has to be bigger than the visible orb so the
--- layered shadow and completion ping have room to bleed outward without
--- being clipped at the canvas edge.
+-- The canvas window itself has to be bigger than the visible pill so the
+-- layered shadow has room to bleed outward without being clipped at the
+-- canvas edge.
 local SHADOW_PAD = 14
 
-local GRANULE_COUNT = 26
-local WAVE_AMPLITUDE = 12 -- max vertical deflection of the recording wave, px
-local granuleParams = nil -- per-granule fixed size/phase/speed variance, set once in ensurePill
+local BAR_COUNT = 9
+local BAR_WIDTH = 4
+local BAR_GAP = 5
+local BAR_MIN_H = 4
+local BAR_MAX_H = 24
 
 local COLOR_PINK = { r = 0.95, g = 0.35, b = 0.55 }
 local COLOR_VIOLET = { r = 0.55, g = 0.35, b = 0.9 }
 
 local pill = nil
-local currentWidth = ORB_D
-local waveTimer = nil   -- must stay referenced: an unreferenced hs.timer can
+local currentWidth = PILL_W
+local waveTimer = nil    -- must stay referenced: an unreferenced hs.timer can
 local breatheTimer = nil -- get garbage-collected before it fires (confirmed
-local pingTimer = nil    -- empirically), silently dropping the callback
+local flashTimer = nil   -- empirically), silently dropping the callback
 local hideTimer = nil
 local wavePhase = 0
 local breathePhase = 0
 local micLevel = 0       -- latest level parsed from sox's meter, 0..1
 local micLevelSmoothed = 0
+local barParams = nil    -- per-bar phase offset for organic wave effect
 
 local function pillFrame(width)
   local screen = (hs.mouse.getCurrentScreen() or hs.screen.mainScreen()):fullFrame()
   return {
     x = screen.x + (screen.w - width) / 2 - SHADOW_PAD,
-    y = screen.y + screen.h - BOTTOM_MARGIN - ORB_D - SHADOW_PAD,
+    y = screen.y + screen.h - PILL_BOTTOM_MARGIN - PILL_H - SHADOW_PAD,
     w = width + SHADOW_PAD * 2,
-    h = ORB_D + SHADOW_PAD * 2,
+    h = PILL_H + SHADOW_PAD * 2,
   }
 end
 
--- Re-lays out the shadow/glass/label elements for the given width (ORB_D
--- for the compact circle states, WIDE_W for the text-capsule states) --
+-- Re-lays out the shadow/glass/label elements for the given width (PILL_W
+-- for the compact pill states, WIDE_W for the text-capsule states) --
 -- height and corner radius never change, only how wide the capsule is.
 local function layout(width)
   currentWidth = width
   pill:frame(pillFrame(width))
-  pill["shadow3"].frame = { x = SHADOW_PAD - 4, y = SHADOW_PAD + 5, w = width + 8, h = ORB_D }
-  pill["shadow2"].frame = { x = SHADOW_PAD - 2, y = SHADOW_PAD + 3, w = width + 4, h = ORB_D }
-  pill["shadow1"].frame = { x = SHADOW_PAD, y = SHADOW_PAD + 1.5, w = width, h = ORB_D }
-  pill["bg"].frame = { x = SHADOW_PAD, y = SHADOW_PAD, w = width, h = ORB_D }
+  pill["shadow3"].frame = { x = SHADOW_PAD - 4, y = SHADOW_PAD + 5, w = width + 8, h = PILL_H }
+  pill["shadow2"].frame = { x = SHADOW_PAD - 2, y = SHADOW_PAD + 3, w = width + 4, h = PILL_H }
+  pill["shadow1"].frame = { x = SHADOW_PAD, y = SHADOW_PAD + 1.5, w = width, h = PILL_H }
+  pill["bg"].frame = { x = SHADOW_PAD, y = SHADOW_PAD, w = width, h = PILL_H }
+
+  -- Position bars centered in the pill (for compact mode)
+  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
+  local startX = SHADOW_PAD + (width - totalBarsWidth) / 2
+  for i = 1, BAR_COUNT do
+    local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
+    pill["bar" .. i].frame = {
+      x = barX,
+      y = SHADOW_PAD + (PILL_H - BAR_MIN_H) / 2,
+      w = BAR_WIDTH,
+      h = BAR_MIN_H,
+    }
+  end
+
+  -- Label positioned after bars (for wide/text mode)
+  local labelX = SHADOW_PAD + 8 + totalBarsWidth + 10 -- after bars with padding
   pill["label"].frame = {
-    x = SHADOW_PAD + ORB_D + 10,
-    y = SHADOW_PAD + (ORB_D - 16) / 2,
-    w = width - ORB_D - 22,
+    x = labelX,
+    y = SHADOW_PAD + (PILL_H - 16) / 2,
+    w = width - (labelX - SHADOW_PAD) - 10,
     h = 16,
   }
 end
@@ -86,7 +102,7 @@ end
 local function ensurePill()
   if pill then return end
 
-  pill = hs.canvas.new(pillFrame(ORB_D))
+  pill = hs.canvas.new(pillFrame(PILL_W))
   pill:level(hs.canvas.windowLevels.overlay)
   pill:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
 
@@ -95,38 +111,36 @@ local function ensurePill()
   -- rounded path and spills a rectangular halo past the curved corners on
   -- light backgrounds (confirmed empirically). Three progressively larger,
   -- more transparent, further-offset rounded rects fake a soft drop shadow
-  -- that still follows the orb's own curve.
+  -- that still follows the pill's own curve.
   pill[1] = {
     id = "shadow3",
     type = "rectangle",
     action = "fill",
     fillColor = { white = 0, alpha = 0.05 },
-    roundedRectRadii = { xRadius = ORB_RADIUS + 3, yRadius = ORB_RADIUS + 3 },
-    frame = { x = SHADOW_PAD - 4, y = SHADOW_PAD + 5, w = ORB_D + 8, h = ORB_D },
+    roundedRectRadii = { xRadius = PILL_RADIUS + 3, yRadius = PILL_RADIUS + 3 },
+    frame = { x = SHADOW_PAD - 4, y = SHADOW_PAD + 5, w = PILL_W + 8, h = PILL_H },
   }
   pill[2] = {
     id = "shadow2",
     type = "rectangle",
     action = "fill",
     fillColor = { white = 0, alpha = 0.08 },
-    roundedRectRadii = { xRadius = ORB_RADIUS + 1, yRadius = ORB_RADIUS + 1 },
-    frame = { x = SHADOW_PAD - 2, y = SHADOW_PAD + 3, w = ORB_D + 4, h = ORB_D },
+    roundedRectRadii = { xRadius = PILL_RADIUS + 1, yRadius = PILL_RADIUS + 1 },
+    frame = { x = SHADOW_PAD - 2, y = SHADOW_PAD + 3, w = PILL_W + 4, h = PILL_H },
   }
   pill[3] = {
     id = "shadow1",
     type = "rectangle",
     action = "fill",
     fillColor = { white = 0, alpha = 0.13 },
-    roundedRectRadii = { xRadius = ORB_RADIUS, yRadius = ORB_RADIUS },
-    frame = { x = SHADOW_PAD, y = SHADOW_PAD + 1.5, w = ORB_D, h = ORB_D },
+    roundedRectRadii = { xRadius = PILL_RADIUS, yRadius = PILL_RADIUS },
+    frame = { x = SHADOW_PAD, y = SHADOW_PAD + 1.5, w = PILL_W, h = PILL_H },
   }
 
-  -- Liquid-glass body: a radial gradient (rather than flat/linear fill)
-  -- with the highlight offset toward the upper-left, like light catching
-  -- a glass sphere, plus a cool greyish border for definition. Stays
-  -- neutral/monochrome always -- color only ever appears in the thin
-  -- wave/ring/ping accents layered on top, never the glass itself, which
-  -- is what keeps this from reading as a colorful Siri-style glow.
+  -- Liquid-glass pill body: a radial gradient (rather than flat/linear fill)
+  -- with the highlight offset toward the upper-left, plus a cool greyish
+  -- border for definition. Stays neutral/monochrome always -- color only
+  -- ever appears in the waveform bars layered on top.
   pill[4] = {
     id = "bg",
     type = "rectangle",
@@ -139,88 +153,55 @@ local function ensurePill()
     fillGradientCenter = { x = -0.35, y = -0.35 },
     strokeColor = { red = 0.6, green = 0.61, blue = 0.64, alpha = 0.5 },
     strokeWidth = 1,
-    roundedRectRadii = { xRadius = ORB_RADIUS, yRadius = ORB_RADIUS },
-    frame = { x = SHADOW_PAD, y = SHADOW_PAD, w = ORB_D, h = ORB_D },
+    roundedRectRadii = { xRadius = PILL_RADIUS, yRadius = PILL_RADIUS },
+    frame = { x = SHADOW_PAD, y = SHADOW_PAD, w = PILL_W, h = PILL_H },
   }
 
-  -- Extra dimensionality on top of the base glass: a thin, low-alpha inner
-  -- shadow ring just inside the edge (depth) and a small bright specular
-  -- highlight patch near the upper-left (a glossy catch-light, like light
-  -- reflecting off a glass sphere) -- both static, always visible, no
-  -- animation needed for these two.
-  pill[5] = {
-    id = "rimShadow",
-    type = "circle",
-    action = "stroke",
-    strokeColor = { white = 0, alpha = 0.1 },
-    strokeWidth = 1.5,
-    center = { x = SHADOW_PAD + ORB_RADIUS, y = SHADOW_PAD + ORB_RADIUS },
-    radius = ORB_RADIUS - 2,
-  }
-  pill[6] = {
-    id = "highlight",
-    type = "circle",
-    action = "fill",
-    fillColor = { red = 1, green = 1, blue = 1, alpha = 0.5 },
-    center = { x = SHADOW_PAD + ORB_D * 0.32, y = SHADOW_PAD + ORB_D * 0.28 },
-    radius = ORB_D * 0.16,
-  }
-
-  -- Recording: a field of small granules (not a clean line) bobbing along
-  -- a wave shape, amplitude driven by real mic level -- reads as a denser,
-  -- more organic "liquid" motion than a smooth ribbon. Each granule has
-  -- its own fixed size/phase/speed variance (picked once, below) so they
-  -- move independently rather than in lockstep. No label needed -- the
-  -- motion alone reads as "listening".
-  granuleParams = {}
-  for i = 1, GRANULE_COUNT do
-    granuleParams[i] = {
-      jitter = math.random() * 6.2832,
-      radius = 1.1 + math.random() * 1.3,
-      alphaBase = 0.45 + math.random() * 0.5,
-      freqMul = 0.85 + math.random() * 0.3,
+  -- Recording/Transcribing/Success: 9 vertical bars that bounce with mic
+  -- level while recording, breathe pink↔violet while transcribing, and
+  -- flash green on success. Each bar has unique timing parameters for an
+  -- organic, liquid feel — like an audio visualizer, not a mechanical meter.
+  barParams = {}
+  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
+  local startX = SHADOW_PAD + (PILL_W - totalBarsWidth) / 2
+  local centerIndex = math.ceil(BAR_COUNT / 2) -- index 5 for 9 bars
+  for i = 1, BAR_COUNT do
+    local distFromCenter = math.abs(i - centerIndex)
+    -- Each bar has unique randomized parameters for organic movement
+    barParams[i] = {
+      -- Multiple phase offsets for layered sine waves
+      phase1 = distFromCenter * 0.4 + math.random() * 0.5,
+      phase2 = math.random() * 6.28,
+      phase3 = math.random() * 6.28,
+      -- Frequency multipliers for variation
+      freq1 = 0.9 + math.random() * 0.2,
+      freq2 = 0.4 + math.random() * 0.3,
+      freq3 = 1.5 + math.random() * 0.5,
+      -- How much each bar responds to mic level (center = strongest)
+      sensitivity = 1 - distFromCenter * 0.08,
+      -- Base "idle" height variation (larger = more visible idle motion)
+      baseHeight = 0.35 + math.random() * 0.2,
+      -- Current smoothed height for spring physics
+      currentHeight = BAR_MIN_H,
+      velocity = 0,
     }
-    pill[6 + i] = {
-      id = "granule" .. i,
-      type = "circle",
+    local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
+    pill[4 + i] = {
+      id = "bar" .. i,
+      type = "rectangle",
       action = "fill",
-      fillColor = { red = 0.85, green = 0.25, blue = 0.25, alpha = 0 }, -- hidden by default
-      center = { x = SHADOW_PAD + ORB_RADIUS, y = SHADOW_PAD + ORB_RADIUS },
-      radius = granuleParams[i].radius,
+      fillColor = { red = 0.9, green = 0.25, blue = 0.25, alpha = 0 }, -- hidden by default
+      roundedRectRadii = { xRadius = 2, yRadius = 2 },
+      frame = {
+        x = barX,
+        y = SHADOW_PAD + (PILL_H - BAR_MIN_H) / 2,
+        w = BAR_WIDTH,
+        h = BAR_MIN_H,
+      },
     }
   end
 
-  -- Transcribing: a soft glow ring that breathes between two colors (pink
-  -- and violet) rather than one flat pulse, distinct motion from the
-  -- recording granules so the two states are never confusable at a
-  -- glance. A fixed two-tone breathing ring, not a hue-cycling blob --
-  -- colorful and distinctive without recreating Siri's animated blob look.
-  pill[6 + GRANULE_COUNT + 1] = {
-    id = "glowRing",
-    type = "circle",
-    action = "stroke",
-    strokeColor = { red = 0.85, green = 0.6, blue = 0.15, alpha = 0 }, -- hidden by default
-    strokeWidth = 2.5,
-    center = { x = SHADOW_PAD + ORB_RADIUS, y = SHADOW_PAD + ORB_RADIUS },
-    radius = ORB_RADIUS - 4,
-  }
-
-  -- Success: a quick burst of staggered expanding, fading rings -- a
-  -- "disperse" instead of ever showing the transcribed text, which would
-  -- just duplicate what already landed in the real text field.
-  for i = 1, 3 do
-    pill[6 + GRANULE_COUNT + 1 + i] = {
-      id = "ping" .. i,
-      type = "circle",
-      action = "stroke",
-      strokeColor = { red = 0.2, green = 0.65, blue = 0.35, alpha = 0 }, -- hidden by default
-      strokeWidth = 2,
-      center = { x = SHADOW_PAD + ORB_RADIUS, y = SHADOW_PAD + ORB_RADIUS },
-      radius = ORB_RADIUS,
-    }
-  end
-
-  pill[6 + GRANULE_COUNT + 5] = {
+  pill[4 + BAR_COUNT + 1] = {
     id = "label",
     type = "text",
     text = "",
@@ -229,9 +210,9 @@ local function ensurePill()
     textFont = ".AppleSystemUIFont",
     textAlignment = "left",
     frame = {
-      x = SHADOW_PAD + ORB_D + 10,
-      y = SHADOW_PAD + (ORB_D - 16) / 2,
-      w = WIDE_W - ORB_D - 22,
+      x = SHADOW_PAD + PILL_H + 10,
+      y = SHADOW_PAD + (PILL_H - 16) / 2,
+      w = WIDE_W - PILL_H - 22,
       h = 16,
     },
   }
@@ -243,8 +224,8 @@ local function stopWave()
     waveTimer = nil
   end
   if pill then
-    for i = 1, GRANULE_COUNT do
-      pill["granule" .. i].fillColor = { red = 0.85, green = 0.25, blue = 0.25, alpha = 0 }
+    for i = 1, BAR_COUNT do
+      pill["bar" .. i].fillColor = { red = 0.9, green = 0.25, blue = 0.25, alpha = 0 }
     end
   end
 end
@@ -255,71 +236,137 @@ local function stopBreathe()
     breatheTimer = nil
   end
   if pill then
-    pill["glowRing"].strokeColor = { red = 0.85, green = 0.6, blue = 0.15, alpha = 0 }
-  end
-end
-
-local function stopPing()
-  if pingTimer then
-    pingTimer:stop()
-    pingTimer = nil
-  end
-  if pill then
-    for i = 1, 3 do
-      pill["ping" .. i].strokeColor = { red = 0.2, green = 0.65, blue = 0.35, alpha = 0 }
+    for i = 1, BAR_COUNT do
+      pill["bar" .. i].fillColor = { red = 0.9, green = 0.25, blue = 0.25, alpha = 0 }
     end
   end
 end
 
--- A field of granules bobbing along a wave shape, amplitude driven by the
--- actual mic level (see parseLevelLine below) -- denser and more organic
--- than a clean line, and each granule's own fixed phase/speed variance
--- (picked once in ensurePill) means they move independently rather than
--- in lockstep, closer to "liquid" than a mechanical equalizer.
+local function stopFlash()
+  if flashTimer then
+    flashTimer:stop()
+    flashTimer = nil
+  end
+end
+
+-- Flowing wave animation — bars form a sine wave pattern that travels
+-- horizontally, with amplitude driven by mic level. Creates a liquid,
+-- organic audio visualizer look rather than bars bouncing in unison.
 local function startWave(color)
   stopWave()
   wavePhase = 0
   micLevel = 0
   micLevelSmoothed = 0
-  waveTimer = hs.timer.doEvery(0.03, function()
-    wavePhase = wavePhase + 0.35
-    -- ease toward the latest parsed level so sox's ~8-10Hz updates don't
-    -- look like discrete jumps at our ~33Hz render rate
-    micLevelSmoothed = micLevelSmoothed + (micLevel - micLevelSmoothed) * 0.55
+  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
+  local startX = SHADOW_PAD + (currentWidth - totalBarsWidth) / 2
+
+  waveTimer = hs.timer.doEvery(0.025, function()  -- ~40fps for smooth motion
+    wavePhase = wavePhase + 0.18  -- wave speed
+    -- Smooth mic level transitions
+    micLevelSmoothed = micLevelSmoothed + (micLevel - micLevelSmoothed) * 0.4
     if not pill then return end
 
-    for i = 1, GRANULE_COUNT do
-      local p = granuleParams[i]
-      local t = (i - 1) / (GRANULE_COUNT - 1)
-      local x = SHADOW_PAD + 8 + t * (ORB_D - 16)
-      -- blend of a fast and a slow component per granule, phase-offset by
-      -- its own jitter, so the field ripples rather than moving as one
-      local wave = 0.7 * math.sin(wavePhase * p.freqMul + t * 7.5 + p.jitter)
-        + 0.3 * math.sin(wavePhase * 0.55 * p.freqMul + t * 4.5 + p.jitter * 1.3)
-      local y = SHADOW_PAD + ORB_RADIUS + wave * WAVE_AMPLITUDE * micLevelSmoothed
-      pill["granule" .. i].center = { x = x, y = y }
-      pill["granule" .. i].fillColor = {
+    for i = 1, BAR_COUNT do
+      local p = barParams[i]
+
+      -- Position along the wave (0 to 1 across all bars)
+      local position = (i - 1) / (BAR_COUNT - 1)
+
+      -- Primary traveling wave — flows left to right
+      local travelingWave = math.sin(wavePhase + position * math.pi * 2)
+
+      -- Secondary wave at different frequency for organic feel
+      local secondaryWave = math.sin(wavePhase * 0.7 + position * math.pi * 3 + p.phase2) * 0.3
+
+      -- Combine waves: primary + secondary + small random variation
+      local combinedWave = travelingWave * 0.7 + secondaryWave + math.sin(wavePhase * p.freq3 + p.phase3) * 0.15
+
+      -- Normalize to 0-1 range
+      combinedWave = (combinedWave + 1.15) / 2.3
+
+      -- Base amplitude (idle) + mic-driven boost
+      local baseAmplitude = 0.25 + 0.15 * math.sin(wavePhase * 0.3 + p.phase1)
+      local micBoost = micLevelSmoothed * p.sensitivity * 0.7
+      local amplitude = baseAmplitude + micBoost
+
+      -- Final height: wave shape modulated by amplitude
+      local targetRatio = amplitude * (0.4 + 0.6 * combinedWave)
+      targetRatio = math.max(0.1, math.min(1, targetRatio))
+      local targetHeight = BAR_MIN_H + (BAR_MAX_H - BAR_MIN_H) * targetRatio
+
+      -- Smooth spring physics
+      local displacement = targetHeight - p.currentHeight
+      p.velocity = p.velocity * 0.75 + displacement * 0.2
+      p.currentHeight = p.currentHeight + p.velocity
+
+      local height = math.max(BAR_MIN_H, math.min(BAR_MAX_H, p.currentHeight))
+      local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
+      local barY = SHADOW_PAD + (PILL_H - height) / 2
+
+      pill["bar" .. i].frame = {
+        x = barX,
+        y = barY,
+        w = BAR_WIDTH,
+        h = height,
+      }
+
+      local alpha = 0.6 + 0.35 * combinedWave
+      pill["bar" .. i].fillColor = {
         red = color.r, green = color.g, blue = color.b,
-        alpha = p.alphaBase * (0.35 + 0.65 * micLevelSmoothed),
+        alpha = alpha,
       }
     end
   end)
 end
 
--- Soft breathing glow ring, shifting between two fixed colors (rather
--- than one flat pulse) -- deliberately slower and calmer than the
--- recording granules, so "processing" never looks like "still listening",
--- and colorful/distinctive without cycling through hues like a
--- Siri-style blob (this is a fixed pink<->violet pair, geometric ring).
+-- Calm breathing animation for transcribing state. Bars gently pulse with
+-- a flowing wave pattern, shifting between pink and violet. Much slower and
+-- more meditative than the recording animation — clearly "thinking", not
+-- "listening". Uses the same organic multi-wave approach for consistency.
 local function startBreathe(fromColor, toColor)
   stopBreathe()
   breathePhase = 0
-  breatheTimer = hs.timer.doEvery(0.04, function()
-    breathePhase = breathePhase + 0.05
-    local mix = 0.5 + 0.5 * math.sin(breathePhase)
-    local alpha = 0.5 + 0.35 * (0.5 + 0.5 * math.sin(breathePhase * 1.7))
-    if pill then
-      pill["glowRing"].strokeColor = {
+  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
+  local startX = SHADOW_PAD + (currentWidth - totalBarsWidth) / 2
+
+  breatheTimer = hs.timer.doEvery(0.03, function()
+    breathePhase = breathePhase + 0.04  -- slower than recording
+    if not pill then return end
+
+    for i = 1, BAR_COUNT do
+      local p = barParams[i]
+
+      -- Layered waves for organic movement (slower frequencies for calm feel)
+      local wave1 = math.sin(breathePhase * p.freq1 * 0.6 + p.phase1) * 0.5
+      local wave2 = math.sin(breathePhase * p.freq2 * 0.5 + p.phase2) * 0.35
+      local wave3 = math.sin(breathePhase * p.freq3 * 0.4 + p.phase3) * 0.15
+      local combinedWave = (wave1 + wave2 + wave3) * 0.5 + 0.5
+
+      -- Color mixing based on combined wave
+      local mix = combinedWave
+
+      -- Height breathes gently: 40-75% of max, with spring smoothing
+      local targetRatio = 0.4 + 0.35 * combinedWave
+      local targetHeight = BAR_MIN_H + (BAR_MAX_H - BAR_MIN_H) * targetRatio
+
+      -- Gentle spring physics for smooth transitions
+      local displacement = targetHeight - p.currentHeight
+      p.velocity = p.velocity * 0.85 + displacement * 0.08
+      p.currentHeight = p.currentHeight + p.velocity
+
+      local height = math.max(BAR_MIN_H, math.min(BAR_MAX_H, p.currentHeight))
+      local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
+      local barY = SHADOW_PAD + (PILL_H - height) / 2
+
+      pill["bar" .. i].frame = {
+        x = barX,
+        y = barY,
+        w = BAR_WIDTH,
+        h = height,
+      }
+      -- Smooth color transition with gentle alpha pulse
+      local alpha = 0.65 + 0.25 * combinedWave
+      pill["bar" .. i].fillColor = {
         red = fromColor.r + (toColor.r - fromColor.r) * mix,
         green = fromColor.g + (toColor.g - fromColor.g) * mix,
         blue = fromColor.b + (toColor.b - fromColor.b) * mix,
@@ -335,9 +382,9 @@ local COLOR_GREEN = { r = 0.2, g = 0.65, b = 0.35 }
 
 local function showWaveform()
   ensurePill()
-  layout(ORB_D)
+  layout(PILL_W)
   stopBreathe()
-  stopPing()
+  stopFlash()
   pill["label"].text = ""
   pill:show(0.18) -- fluid fade-in rather than an instant pop
   startWave(COLOR_RED)
@@ -345,60 +392,68 @@ end
 
 local function showProcessing()
   ensurePill()
-  layout(ORB_D)
+  layout(PILL_W)
   stopWave()
-  stopPing()
+  stopFlash()
   pill["label"].text = ""
   pill:show(0.18)
   startBreathe(COLOR_PINK, COLOR_VIOLET)
 end
 
--- A quick burst of staggered expanding, fading rings instead of ever
--- showing the transcribed text -- it already landed in the real text
--- field, so showing it again here would just be noise. Three rings, each
--- starting a beat after the last, read as a single "disperse" moment
--- rather than one mechanical pulse.
-local PING_STAGGER = 0.12  -- seconds between each ring's start
-local PING_DURATION = 0.5  -- how long each individual ring takes to fade out
+-- Flash all bars green briefly, then fade out the pill.
+local FLASH_DURATION = 0.3
 
-local function showSuccessPing(color)
+local function showSuccessFlash(color)
   ensurePill()
-  layout(ORB_D)
+  layout(PILL_W)
   stopWave()
   stopBreathe()
-  stopPing()
+  stopFlash()
   pill["label"].text = ""
   pill:show(0.15)
 
-  local elapsed = 0
-  local totalDuration = PING_DURATION + PING_STAGGER * 2
-  pingTimer = hs.timer.doEvery(0.02, function()
-    elapsed = elapsed + 0.02
-    if not pill then return end
-    for i = 1, 3 do
-      local localElapsed = elapsed - (i - 1) * PING_STAGGER
-      local progress = math.max(0, math.min(1, localElapsed / PING_DURATION))
-      local alpha = localElapsed <= 0 and 0 or (0.75 * (1 - progress))
-      pill["ping" .. i].radius = ORB_RADIUS + progress * (14 + (i - 1) * 4)
-      pill["ping" .. i].strokeColor = { red = color.r, green = color.g, blue = color.b, alpha = alpha }
-    end
-    if elapsed >= totalDuration and pingTimer then
-      pingTimer:stop()
-      pingTimer = nil
-    end
-  end)
+  -- Set all bars to success color at full height
+  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
+  local startX = SHADOW_PAD + (PILL_W - totalBarsWidth) / 2
+  local height = BAR_MAX_H * 0.7
+
+  for i = 1, BAR_COUNT do
+    local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
+    local barY = SHADOW_PAD + (PILL_H - height) / 2
+    pill["bar" .. i].frame = {
+      x = barX,
+      y = barY,
+      w = BAR_WIDTH,
+      h = height,
+    }
+    pill["bar" .. i].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.9 }
+  end
 end
 
 -- Only used for the rare error/info message that actually needs to be
 -- read (no speech detected, a request failing) -- widens into a capsule
--- with the glass orb on the left and text on the right.
+-- with the bars on the left and text on the right.
 local function showSteady(text, color)
   ensurePill()
   layout(WIDE_W)
   stopWave()
   stopBreathe()
-  stopPing()
-  pill["glowRing"].strokeColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.8 }
+  stopFlash()
+  -- Show bars at steady height with the status color, positioned on the left
+  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
+  local startX = SHADOW_PAD + 8 -- left-aligned with small padding
+  local height = BAR_MAX_H * 0.5
+  for i = 1, BAR_COUNT do
+    local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
+    local barY = SHADOW_PAD + (PILL_H - height) / 2
+    pill["bar" .. i].frame = {
+      x = barX,
+      y = barY,
+      w = BAR_WIDTH,
+      h = height,
+    }
+    pill["bar" .. i].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.7 }
+  end
   pill["label"].text = text
   pill:show(0.18)
 end
@@ -407,7 +462,7 @@ local function hidePillAfter(delay)
   hideTimer = hs.timer.doAfter(delay, function()
     stopWave()
     stopBreathe()
-    stopPing()
+    stopFlash()
     if pill then pill:hide(0.3) end -- fluid fade-out
   end)
 end
@@ -829,7 +884,7 @@ local function stopRecordingAndSend()
       -- can't pick up its own synthetic keys.
       startLearnWatch(decoded.text)
 
-      showSuccessPing(COLOR_GREEN)
+      showSuccessFlash(COLOR_GREEN)
       hidePillAfter(0.85)
 
       hs.task.new(M.config.curlPath, nil, {
@@ -878,12 +933,18 @@ local function handleFlagsChanged(event)
 end
 
 function M.start()
-  -- Reload Config re-runs this without the process restarting, so a stale
-  -- watcher from the previous load must be stopped first or Fn presses
-  -- fire two+ overlapping recordings/HUDs at once instead of one.
+  -- Reload Config re-runs this without the process restarting, so stale
+  -- watchers and canvases from the previous load must be cleaned up first.
   if fnWatcher then
     fnWatcher:stop()
   end
+  -- Delete old pill canvas so ensurePill() creates a fresh one with the
+  -- current design (important when the HUD layout changes between versions).
+  if pill then
+    pill:delete()
+    pill = nil
+  end
+  barParams = nil
   fnWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, handleFlagsChanged)
   fnWatcher:start()
 end
