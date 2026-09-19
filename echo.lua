@@ -23,10 +23,10 @@ M.config = require("echo_config")
 -- failing) where a message actually needs to be read.
 --------------------------------------------------------------------------
 
-local PILL_W = 120 -- width of the compact pill (recording/processing/success)
+local PILL_W = 160 -- width of the compact pill (recording/processing/success)
 local PILL_H = 36 -- height of the pill
 local PILL_RADIUS = 18 -- half of height for full pill shape
-local WIDE_W = 220 -- width when widened into a capsule to show an error/info message
+local WIDE_W = 260 -- width when widened into a capsule to show an error/info message
 local PILL_BOTTOM_MARGIN = 30 -- lower/closer to the screen edge, out of the way of text boxes
 
 -- The canvas window itself has to be bigger than the visible pill so the
@@ -111,12 +111,13 @@ local function ensurePill()
   -- rounded path and spills a rectangular halo past the curved corners on
   -- light backgrounds (confirmed empirically). Three progressively larger,
   -- more transparent, further-offset rounded rects fake a soft drop shadow
-  -- that still follows the pill's own curve.
+  -- that still follows the pill's own curve. Kept subtle to match the
+  -- transparent glass aesthetic.
   pill[1] = {
     id = "shadow3",
     type = "rectangle",
     action = "fill",
-    fillColor = { white = 0, alpha = 0.05 },
+    fillColor = { white = 0, alpha = 0.03 },
     roundedRectRadii = { xRadius = PILL_RADIUS + 3, yRadius = PILL_RADIUS + 3 },
     frame = { x = SHADOW_PAD - 4, y = SHADOW_PAD + 5, w = PILL_W + 8, h = PILL_H },
   }
@@ -124,7 +125,7 @@ local function ensurePill()
     id = "shadow2",
     type = "rectangle",
     action = "fill",
-    fillColor = { white = 0, alpha = 0.08 },
+    fillColor = { white = 0, alpha = 0.05 },
     roundedRectRadii = { xRadius = PILL_RADIUS + 1, yRadius = PILL_RADIUS + 1 },
     frame = { x = SHADOW_PAD - 2, y = SHADOW_PAD + 3, w = PILL_W + 4, h = PILL_H },
   }
@@ -132,27 +133,27 @@ local function ensurePill()
     id = "shadow1",
     type = "rectangle",
     action = "fill",
-    fillColor = { white = 0, alpha = 0.13 },
+    fillColor = { white = 0, alpha = 0.08 },
     roundedRectRadii = { xRadius = PILL_RADIUS, yRadius = PILL_RADIUS },
     frame = { x = SHADOW_PAD, y = SHADOW_PAD + 1.5, w = PILL_W, h = PILL_H },
   }
 
-  -- Liquid-glass pill body: a radial gradient (rather than flat/linear fill)
-  -- with the highlight offset toward the upper-left, plus a cool greyish
-  -- border for definition. Stays neutral/monochrome always -- color only
-  -- ever appears in the waveform bars layered on top.
+  -- Apple-style frosted glass pill body: highly transparent with a subtle
+  -- gradient and thin border. The transparency lets the background show
+  -- through while the gradient provides depth. Color only appears in the
+  -- waveform bars layered on top.
   pill[4] = {
     id = "bg",
     type = "rectangle",
     action = "strokeAndFill",
     fillGradient = "radial",
     fillGradientColors = {
-      { red = 1, green = 1, blue = 1, alpha = 0.8 },
-      { red = 0.82, green = 0.83, blue = 0.86, alpha = 0.42 },
+      { red = 1, green = 1, blue = 1, alpha = 0.45 },
+      { red = 0.92, green = 0.93, blue = 0.95, alpha = 0.25 },
     },
-    fillGradientCenter = { x = -0.35, y = -0.35 },
-    strokeColor = { red = 0.6, green = 0.61, blue = 0.64, alpha = 0.5 },
-    strokeWidth = 1,
+    fillGradientCenter = { x = -0.3, y = -0.4 },
+    strokeColor = { red = 0.85, green = 0.86, blue = 0.88, alpha = 0.4 },
+    strokeWidth = 0.5,
     roundedRectRadii = { xRadius = PILL_RADIUS, yRadius = PILL_RADIUS },
     frame = { x = SHADOW_PAD, y = SHADOW_PAD, w = PILL_W, h = PILL_H },
   }
@@ -542,11 +543,10 @@ local function hideLearnPopup()
   learnPopupPending = nil
 end
 
-local function commitLearn()
-  if not learnPopupPending then return end
-  local alias, term = learnPopupPending.alias, learnPopupPending.term
-  hideLearnPopup()
-
+-- Auto-saves a vocabulary correction without requiring user confirmation.
+-- Called automatically when a clear single-word substitution is detected.
+local function autoLearnCorrection(alias, term)
+  print(string.format("Echo: auto-learning '%s' → '%s'", alias, term))
   hs.task.new(M.config.curlPath, function(exitCode, _stdOut, stdErr)
     if exitCode ~= 0 then
       print(string.format("Echo: vocabulary POST failed exit=%s stderr=%s", tostring(exitCode), stdErr or "(none)"))
@@ -558,6 +558,13 @@ local function commitLearn()
     "-H", "Content-Type: application/json",
     "-d", hs.json.encode({ term = term, alias = alias }),
   }):start()
+end
+
+local function commitLearn()
+  if not learnPopupPending then return end
+  local alias, term = learnPopupPending.alias, learnPopupPending.term
+  hideLearnPopup()
+  autoLearnCorrection(alias, term)
 end
 
 local function showLearnPrompt(alias, term)
@@ -679,7 +686,8 @@ local function finishKeystrokeWatch(shouldDiff)
      and keystrokeOriginalText ~= keystrokeShadowText then
     local alias, term = singleWordSubstitution(keystrokeOriginalText, keystrokeShadowText)
     if alias and term then
-      showLearnPrompt(alias, term)
+      -- Auto-learn corrections without requiring confirmation popup
+      autoLearnCorrection(alias, term)
     end
   end
   keystrokeOriginalText = nil
