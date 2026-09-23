@@ -1229,7 +1229,7 @@ local function rewriteSelectedText()
         return
       end
 
-      -- Paste the rewritten text (replaces selection)
+      -- Paste the polished text (replaces selection)
       hs.pasteboard.setContents(decoded.text)
       hs.eventtap.keyStroke({"cmd"}, "v", 0)
 
@@ -1237,7 +1237,7 @@ local function rewriteSelectedText()
       hidePillAfter(0.85)
     end, {
       "-s", "-S", "-X", "POST",
-      M.config.apiUrl .. "/chat/message",
+      M.config.apiUrl .. "/rewrite",
       "-H", "x-api-key: " .. M.config.apiKey,
       "-H", "Content-Type: application/json",
       "-d", requestBody,
