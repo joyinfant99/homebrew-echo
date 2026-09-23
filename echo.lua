@@ -1179,6 +1179,97 @@ local function stopRecordingAndSend()
   end)
 end
 
+--------------------------------------------------------------------------
+-- Rewrite selected text: double-tap Control to rewrite whatever's selected
+-- using the same "Joy's voice" rewrite as voice transcripts. Copies the
+-- selection, calls /chat/message, pastes the result back.
+--------------------------------------------------------------------------
+
+local DOUBLE_TAP_THRESHOLD = 0.35  -- seconds between taps to count as double-tap
+local ctrlLastTapTime = 0
+local ctrlWasDown = false
+local ctrlWatcher = nil
+local rewriteTimer = nil  -- must stay referenced (GC gotcha)
+
+local function rewriteSelectedText()
+  -- Copy current selection to clipboard
+  local oldClipboard = hs.pasteboard.getContents()
+  hs.eventtap.keyStroke({"cmd"}, "c", 0)
+
+  -- Give the system a moment to update the clipboard
+  rewriteTimer = hs.timer.doAfter(0.1, function()
+    local selectedText = hs.pasteboard.getContents()
+
+    -- Check if we actually got new text (not the same as before, and not empty)
+    if not selectedText or selectedText == "" or selectedText == oldClipboard then
+      showSteady("No text selected", COLOR_AMBER)
+      hidePillAfter(1.2)
+      return
+    end
+
+    -- Show processing state
+    showProcessing()
+
+    -- Call the rewrite API
+    local requestBody = hs.json.encode({ text = selectedText })
+
+    hs.task.new(M.config.curlPath, function(exitCode, stdOut, stdErr)
+      if exitCode ~= 0 then
+        print(string.format("Echo rewrite: curl exit=%s stderr=%s", tostring(exitCode), stdErr or "(none)"))
+        showSteady("Rewrite failed", COLOR_RED)
+        hidePillAfter(1.4)
+        return
+      end
+
+      local ok, decoded = pcall(hs.json.decode, stdOut)
+      if not ok or not decoded or not decoded.text then
+        print(string.format("Echo rewrite: bad response body=%s", stdOut or "(empty)"))
+        showSteady("Bad response", COLOR_RED)
+        hidePillAfter(1.4)
+        return
+      end
+
+      -- Paste the rewritten text (replaces selection)
+      hs.pasteboard.setContents(decoded.text)
+      hs.eventtap.keyStroke({"cmd"}, "v", 0)
+
+      showSuccessFlash(COLOR_GREEN)
+      hidePillAfter(0.85)
+    end, {
+      "-s", "-S", "-X", "POST",
+      M.config.apiUrl .. "/chat/message",
+      "-H", "x-api-key: " .. M.config.apiKey,
+      "-H", "Content-Type: application/json",
+      "-d", requestBody,
+    }):start()
+  end)
+end
+
+local function handleCtrlFlagsChanged(event)
+  local isCtrlDown = event:getFlags().ctrl or false
+
+  -- Detect rising edge (ctrl just pressed)
+  if isCtrlDown and not ctrlWasDown then
+    local now = hs.timer.secondsSinceEpoch()
+    local timeSinceLastTap = now - ctrlLastTapTime
+
+    if timeSinceLastTap < DOUBLE_TAP_THRESHOLD then
+      -- Double-tap detected
+      ctrlLastTapTime = 0  -- reset to prevent triple-tap triggering again
+      rewriteSelectedText()
+    else
+      ctrlLastTapTime = now
+    end
+  end
+
+  ctrlWasDown = isCtrlDown
+  return false  -- don't consume the event
+end
+
+--------------------------------------------------------------------------
+-- Voice recording: hold Fn to record, release to transcribe
+--------------------------------------------------------------------------
+
 -- The bare Fn key is a modifier flag, not a regular key, so it can't go
 -- through hs.hotkey.bind (which needs a real key plus optional modifiers).
 -- Instead watch flagsChanged events and react on the fn flag's rising and
@@ -1212,6 +1303,9 @@ function M.start()
   if fnWatcher then
     fnWatcher:stop()
   end
+  if ctrlWatcher then
+    ctrlWatcher:stop()
+  end
   -- Delete old orb canvas so ensureOrb() creates a fresh one with the
   -- current design (important when the HUD layout changes between versions).
   stopAnimation()
@@ -1221,8 +1315,14 @@ function M.start()
   end
   layerParams = nil
   waveParams = nil
+
+  -- Fn key: hold to record voice
   fnWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, handleFlagsChanged)
   fnWatcher:start()
+
+  -- Control key: double-tap to rewrite selected text
+  ctrlWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, handleCtrlFlagsChanged)
+  ctrlWatcher:start()
 end
 
 return M
