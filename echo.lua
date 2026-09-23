@@ -1207,6 +1207,11 @@ local function rewriteSelectedText()
       return
     end
 
+    -- Delete the selection now (while it's still selected) so we can paste the
+    -- replacement later without worrying about the selection being lost during
+    -- the API call. The original text is safe in selectedText if anything fails.
+    hs.eventtap.keyStroke({}, "delete", 0)
+
     -- Show processing state
     showProcessing()
 
@@ -1216,6 +1221,9 @@ local function rewriteSelectedText()
     hs.task.new(M.config.curlPath, function(exitCode, stdOut, stdErr)
       if exitCode ~= 0 then
         print(string.format("Echo rewrite: curl exit=%s stderr=%s", tostring(exitCode), stdErr or "(none)"))
+        -- Restore original text on failure
+        hs.pasteboard.setContents(selectedText)
+        hs.eventtap.keyStroke({"cmd"}, "v", 0)
         showSteady("Rewrite failed", COLOR_RED)
         hidePillAfter(1.4)
         return
@@ -1224,12 +1232,15 @@ local function rewriteSelectedText()
       local ok, decoded = pcall(hs.json.decode, stdOut)
       if not ok or not decoded or not decoded.text then
         print(string.format("Echo rewrite: bad response body=%s", stdOut or "(empty)"))
+        -- Restore original text on failure
+        hs.pasteboard.setContents(selectedText)
+        hs.eventtap.keyStroke({"cmd"}, "v", 0)
         showSteady("Bad response", COLOR_RED)
         hidePillAfter(1.4)
         return
       end
 
-      -- Paste the polished text (replaces selection)
+      -- Paste the polished text at cursor (selection was already deleted)
       hs.pasteboard.setContents(decoded.text)
       hs.eventtap.keyStroke({"cmd"}, "v", 0)
 
