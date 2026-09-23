@@ -1,4 +1,4 @@
--- Echo hotkey recorder for Hammerspoon.
+-- Echo hotkey recorder for Hammerspoon (v2026.09.23 — Siri-style orb HUD).
 -- Hold the hotkey to record, release to transcribe. Requires `sox`
 -- (brew install sox) for the `rec` command-line recorder.
 --
@@ -14,457 +14,576 @@ local M = {}
 M.config = require("echo_config")
 
 --------------------------------------------------------------------------
--- Pill HUD with waveform bars: a compact horizontal pill pinned near the
--- bottom of the screen, replacing Hammerspoon's default centered
--- hs.alert popups. Each state reads from its motion alone: 9 vertical
--- bars bouncing with mic level while recording, bars breathing pink↔violet
--- while transcribing, a green flash on success. It only widens into a text
--- capsule for the rare error/info case (no speech detected, a request
--- failing) where a message actually needs to be read.
+-- Siri-like Orb HUD: Simulates Apple's Siri orb using layered rotating
+-- gradients. Uses 12 color layers that rotate at different speeds, creating
+-- the signature swirling effect. Positioned bottom-center of the screen.
+-- Amplitude-reactive during recording, faster rotation during processing
+-- ("thinking").
 --------------------------------------------------------------------------
 
-local PILL_W = 160 -- width of the compact pill (recording/processing/success)
-local PILL_H = 36 -- height of the pill
-local PILL_RADIUS = 18 -- half of height for full pill shape
-local WIDE_W = 260 -- width when widened into a capsule to show an error/info message
-local PILL_BOTTOM_MARGIN = 30 -- lower/closer to the screen edge, out of the way of text boxes
+-- Orb dimensions and positioning
+local ORB_DIAMETER = 52          -- compact orb size
+local CANVAS_SIZE = 140          -- canvas size (includes glow room)
+local ORB_MARGIN_BOTTOM = 35     -- margin from bottom edge
 
--- The canvas window itself has to be bigger than the visible pill so the
--- layered shadow has room to bleed outward without being clipped at the
--- canvas edge.
-local SHADOW_PAD = 14
+-- Refined Siri color palette - more stops for smoother gradients
+local SIRI_COLORS = {
+  { r = 0.05, g = 0.55, b = 1.00 },  -- deep cyan
+  { r = 0.20, g = 0.45, b = 1.00 },  -- azure
+  { r = 0.45, g = 0.30, b = 1.00 },  -- violet
+  { r = 0.65, g = 0.20, b = 0.95 },  -- purple
+  { r = 0.85, g = 0.18, b = 0.80 },  -- magenta
+  { r = 1.00, g = 0.30, b = 0.55 },  -- pink
+  { r = 1.00, g = 0.45, b = 0.35 },  -- coral
+  { r = 1.00, g = 0.60, b = 0.20 },  -- orange
+  { r = 0.70, g = 0.80, b = 0.25 },  -- lime
+  { r = 0.25, g = 0.85, b = 0.55 },  -- teal
+  { r = 0.15, g = 0.75, b = 0.80 },  -- turquoise
+  { r = 0.10, g = 0.60, b = 0.95 },  -- sky
+}
 
-local BAR_COUNT = 9
-local BAR_WIDTH = 4
-local BAR_GAP = 5
-local BAR_MIN_H = 4
-local BAR_MAX_H = 24
+-- More layers for smoother, higher-fidelity swirl
+local LAYER_COUNT = 12
 
-local COLOR_PINK = { r = 0.95, g = 0.35, b = 0.55 }
-local COLOR_VIOLET = { r = 0.55, g = 0.35, b = 0.9 }
+-- More wave particles for finer fluid effect
+local WAVE_COUNT = 16
 
-local pill = nil
-local currentWidth = PILL_W
-local waveTimer = nil    -- must stay referenced: an unreferenced hs.timer can
-local breatheTimer = nil -- get garbage-collected before it fires (confirmed
-local flashTimer = nil   -- empirically), silently dropping the callback
-local hideTimer = nil
-local wavePhase = 0
-local breathePhase = 0
+local orb = nil
+local waveParams = nil  -- per-wave-particle animation parameters
+local orbTimer = nil     -- must stay referenced: an unreferenced hs.timer can
+local hideTimer = nil    -- get garbage-collected before it fires (confirmed empirically)
+local orbAngle = 0       -- main rotation angle
 local micLevel = 0       -- latest level parsed from sox's meter, 0..1
 local micLevelSmoothed = 0
-local barParams = nil    -- per-bar phase offset for organic wave effect
+local orbScale = 1       -- current scale (grows with amplitude)
+local orbTargetScale = 1
+local layerParams = nil  -- per-layer animation parameters
+local orbMode = "idle"   -- "idle", "recording", "processing", "success", "text"
+local rotationSpeed = 0.08  -- base rotation speed (radians per frame)
 
-local function pillFrame(width)
+-- Orb frame positioned at bottom-center of screen
+local function orbFrame()
   local screen = (hs.mouse.getCurrentScreen() or hs.screen.mainScreen()):fullFrame()
   return {
-    x = screen.x + (screen.w - width) / 2 - SHADOW_PAD,
-    y = screen.y + screen.h - PILL_BOTTOM_MARGIN - PILL_H - SHADOW_PAD,
-    w = width + SHADOW_PAD * 2,
-    h = PILL_H + SHADOW_PAD * 2,
+    x = screen.x + (screen.w - CANVAS_SIZE) / 2,  -- horizontally centered
+    y = screen.y + screen.h - CANVAS_SIZE - ORB_MARGIN_BOTTOM,
+    w = CANVAS_SIZE,
+    h = CANVAS_SIZE,
   }
 end
 
--- Re-lays out the shadow/glass/label elements for the given width (PILL_W
--- for the compact pill states, WIDE_W for the text-capsule states) --
--- height and corner radius never change, only how wide the capsule is.
-local function layout(width)
-  currentWidth = width
-  pill:frame(pillFrame(width))
-  pill["shadow3"].frame = { x = SHADOW_PAD - 4, y = SHADOW_PAD + 5, w = width + 8, h = PILL_H }
-  pill["shadow2"].frame = { x = SHADOW_PAD - 2, y = SHADOW_PAD + 3, w = width + 4, h = PILL_H }
-  pill["shadow1"].frame = { x = SHADOW_PAD, y = SHADOW_PAD + 1.5, w = width, h = PILL_H }
-  pill["bg"].frame = { x = SHADOW_PAD, y = SHADOW_PAD, w = width, h = PILL_H }
+-- Create the orb canvas with layered rotating color bands
+local function ensureOrb()
+  if orb then return end
 
-  -- Position bars centered in the pill (for compact mode)
-  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
-  local startX = SHADOW_PAD + (width - totalBarsWidth) / 2
-  for i = 1, BAR_COUNT do
-    local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
-    pill["bar" .. i].frame = {
-      x = barX,
-      y = SHADOW_PAD + (PILL_H - BAR_MIN_H) / 2,
-      w = BAR_WIDTH,
-      h = BAR_MIN_H,
+  orb = hs.canvas.new(orbFrame())
+  orb:level(hs.canvas.windowLevels.overlay)
+  orb:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
+
+  local center = CANVAS_SIZE / 2
+  local radius = ORB_DIAMETER / 2
+
+  -- Initialize layer parameters - finer distribution for smoother swirl
+  layerParams = {}
+  for i = 1, LAYER_COUNT do
+    local golden = (i - 1) * 2.39996323  -- golden angle for natural distribution
+    layerParams[i] = {
+      angleOffset = golden,
+      speedMult = 0.5 + (i * 0.08),  -- gentler speed variation
+      direction = (i % 3 == 0) and -1 or 1,  -- less uniform direction changes
+      orbitRadius = radius * (0.2 + (i / LAYER_COUNT) * 0.35),  -- tighter orbits
+      size = radius * (0.25 + (i / LAYER_COUNT) * 0.2),  -- smaller blobs
     }
   end
 
-  -- Label positioned after bars (for wide/text mode)
-  local labelX = SHADOW_PAD + 8 + totalBarsWidth + 10 -- after bars with padding
-  pill["label"].frame = {
-    x = labelX,
-    y = SHADOW_PAD + (PILL_H - 16) / 2,
-    w = width - (labelX - SHADOW_PAD) - 10,
-    h = 16,
-  }
-end
-
-local function ensurePill()
-  if pill then return end
-
-  pill = hs.canvas.new(pillFrame(PILL_W))
-  pill:level(hs.canvas.windowLevels.overlay)
-  pill:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
-
-  -- A soft, layered shadow instead of hs.canvas's own per-element shadow
-  -- property, which renders against the bounding box rather than the
-  -- rounded path and spills a rectangular halo past the curved corners on
-  -- light backgrounds (confirmed empirically). Three progressively larger,
-  -- more transparent, further-offset rounded rects fake a soft drop shadow
-  -- that still follows the pill's own curve. Kept subtle to match the
-  -- transparent glass aesthetic.
-  pill[1] = {
-    id = "shadow3",
-    type = "rectangle",
+  -- More glow layers for smoother falloff (5 layers instead of 3)
+  orb[1] = {
+    id = "glow5",
+    type = "circle",
     action = "fill",
-    fillColor = { white = 0, alpha = 0.03 },
-    roundedRectRadii = { xRadius = PILL_RADIUS + 3, yRadius = PILL_RADIUS + 3 },
-    frame = { x = SHADOW_PAD - 4, y = SHADOW_PAD + 5, w = PILL_W + 8, h = PILL_H },
+    center = { x = center, y = center },
+    radius = radius * 1.9,
+    fillColor = { red = 0.25, green = 0.35, blue = 0.85, alpha = 0.03 },
   }
-  pill[2] = {
-    id = "shadow2",
-    type = "rectangle",
+  orb[2] = {
+    id = "glow4",
+    type = "circle",
     action = "fill",
-    fillColor = { white = 0, alpha = 0.05 },
-    roundedRectRadii = { xRadius = PILL_RADIUS + 1, yRadius = PILL_RADIUS + 1 },
-    frame = { x = SHADOW_PAD - 2, y = SHADOW_PAD + 3, w = PILL_W + 4, h = PILL_H },
+    center = { x = center, y = center },
+    radius = radius * 1.6,
+    fillColor = { red = 0.35, green = 0.40, blue = 0.90, alpha = 0.05 },
   }
-  pill[3] = {
-    id = "shadow1",
-    type = "rectangle",
+  orb[3] = {
+    id = "glow3",
+    type = "circle",
     action = "fill",
-    fillColor = { white = 0, alpha = 0.08 },
-    roundedRectRadii = { xRadius = PILL_RADIUS, yRadius = PILL_RADIUS },
-    frame = { x = SHADOW_PAD, y = SHADOW_PAD + 1.5, w = PILL_W, h = PILL_H },
+    center = { x = center, y = center },
+    radius = radius * 1.4,
+    fillColor = { red = 0.45, green = 0.35, blue = 0.92, alpha = 0.07 },
+  }
+  orb[4] = {
+    id = "glow2",
+    type = "circle",
+    action = "fill",
+    center = { x = center, y = center },
+    radius = radius * 1.2,
+    fillColor = { red = 0.55, green = 0.35, blue = 0.95, alpha = 0.10 },
+  }
+  orb[5] = {
+    id = "glow1",
+    type = "circle",
+    action = "fill",
+    center = { x = center, y = center },
+    radius = radius * 1.05,
+    fillColor = { red = 0.60, green = 0.40, blue = 1.0, alpha = 0.14 },
   }
 
-  -- Apple-style frosted glass pill body: highly transparent with a subtle
-  -- gradient and thin border. The transparency lets the background show
-  -- through while the gradient provides depth. Color only appears in the
-  -- waveform bars layered on top.
-  pill[4] = {
-    id = "bg",
-    type = "rectangle",
-    action = "strokeAndFill",
-    fillGradient = "radial",
-    fillGradientColors = {
-      { red = 1, green = 1, blue = 1, alpha = 0.45 },
-      { red = 0.92, green = 0.93, blue = 0.95, alpha = 0.25 },
-    },
-    fillGradientCenter = { x = -0.3, y = -0.4 },
-    strokeColor = { red = 0.85, green = 0.86, blue = 0.88, alpha = 0.4 },
-    strokeWidth = 0.5,
-    roundedRectRadii = { xRadius = PILL_RADIUS, yRadius = PILL_RADIUS },
-    frame = { x = SHADOW_PAD, y = SHADOW_PAD, w = PILL_W, h = PILL_H },
-  }
-
-  -- Recording/Transcribing/Success: 9 vertical bars that bounce with mic
-  -- level while recording, breathe pink↔violet while transcribing, and
-  -- flash green on success. Each bar has unique timing parameters for an
-  -- organic, liquid feel — like an audio visualizer, not a mechanical meter.
-  barParams = {}
-  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
-  local startX = SHADOW_PAD + (PILL_W - totalBarsWidth) / 2
-  local centerIndex = math.ceil(BAR_COUNT / 2) -- index 5 for 9 bars
-  for i = 1, BAR_COUNT do
-    local distFromCenter = math.abs(i - centerIndex)
-    -- Each bar has unique randomized parameters for organic movement
-    barParams[i] = {
-      -- Multiple phase offsets for layered sine waves
-      phase1 = distFromCenter * 0.4 + math.random() * 0.5,
-      phase2 = math.random() * 6.28,
-      phase3 = math.random() * 6.28,
-      -- Frequency multipliers for variation
-      freq1 = 0.9 + math.random() * 0.2,
-      freq2 = 0.4 + math.random() * 0.3,
-      freq3 = 1.5 + math.random() * 0.5,
-      -- How much each bar responds to mic level (center = strongest)
-      sensitivity = 1 - distFromCenter * 0.08,
-      -- Base "idle" height variation (larger = more visible idle motion)
-      baseHeight = 0.35 + math.random() * 0.2,
-      -- Current smoothed height for spring physics
-      currentHeight = BAR_MIN_H,
-      velocity = 0,
-    }
-    local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
-    pill[4 + i] = {
-      id = "bar" .. i,
-      type = "rectangle",
+  -- Elements 6-17: The 12 rotating color layers (finer swirl effect)
+  local GLOW_COUNT = 5
+  for i = 1, LAYER_COUNT do
+    local color = SIRI_COLORS[i]
+    orb[GLOW_COUNT + i] = {
+      id = "layer" .. i,
+      type = "circle",
       action = "fill",
-      fillColor = { red = 0.9, green = 0.25, blue = 0.25, alpha = 0 }, -- hidden by default
-      roundedRectRadii = { xRadius = 2, yRadius = 2 },
-      frame = {
-        x = barX,
-        y = SHADOW_PAD + (PILL_H - BAR_MIN_H) / 2,
-        w = BAR_WIDTH,
-        h = BAR_MIN_H,
+      center = { x = center, y = center },
+      radius = layerParams[i].size,
+      fillGradient = "radial",
+      fillGradientColors = {
+        { red = color.r, green = color.g, blue = color.b, alpha = 0.55 },
+        { red = color.r, green = color.g, blue = color.b, alpha = 0.0 },
       },
     }
   end
 
-  pill[4 + BAR_COUNT + 1] = {
+  -- Initialize wave particle parameters - finer, more numerous particles
+  waveParams = {}
+  for i = 1, WAVE_COUNT do
+    local golden = (i - 1) * 2.39996323  -- golden angle
+    waveParams[i] = {
+      phase = golden,
+      baseRadius = radius * (0.04 + math.random() * 0.025),  -- 4-6.5% - much smaller
+      orbitRadius = radius * (0.08 + (i % 4) * 0.06),  -- tighter orbits, 4 tiers
+      speedMult = 0.6 + math.random() * 0.5,
+      direction = (i % 3 == 0) and -1 or 1,
+      waveFreq = 2.0 + math.random() * 2.0,  -- faster wave frequency
+      colorIndex = ((i - 1) % 12) + 1,  -- cycle through all 12 colors
+    }
+  end
+
+  -- Elements 18-33: Center wave particles (finer fluid dots)
+  for i = 1, WAVE_COUNT do
+    local color = SIRI_COLORS[waveParams[i].colorIndex]
+    orb[GLOW_COUNT + LAYER_COUNT + i] = {
+      id = "wave" .. i,
+      type = "circle",
+      action = "fill",
+      center = { x = center, y = center },
+      radius = waveParams[i].baseRadius,
+      fillGradient = "radial",
+      fillGradientColors = {
+        { red = color.r, green = color.g, blue = color.b, alpha = 0.85 },
+        { red = color.r, green = color.g, blue = color.b, alpha = 0.25 },
+      },
+    }
+  end
+
+  -- Element 34: Bright center core (smaller, crisper)
+  orb[GLOW_COUNT + LAYER_COUNT + WAVE_COUNT + 1] = {
+    id = "core",
+    type = "circle",
+    action = "fill",
+    center = { x = center, y = center },
+    radius = radius * 0.12,
+    fillGradient = "radial",
+    fillGradientColors = {
+      { white = 1, alpha = 0.98 },
+      { white = 1, alpha = 0.2 },
+    },
+  }
+
+  -- Element 35: Text label (for error/info messages)
+  orb[GLOW_COUNT + LAYER_COUNT + WAVE_COUNT + 2] = {
     id = "label",
     type = "text",
     text = "",
-    textColor = { red = 0.12, green = 0.12, blue = 0.14, alpha = 0.9 },
-    textSize = 12.5,
+    textColor = { white = 1, alpha = 0 },
+    textSize = 11,
     textFont = ".AppleSystemUIFont",
-    textAlignment = "left",
-    frame = {
-      x = SHADOW_PAD + PILL_H + 10,
-      y = SHADOW_PAD + (PILL_H - 16) / 2,
-      w = WIDE_W - PILL_H - 22,
-      h = 16,
-    },
+    textAlignment = "center",
+    frame = { x = 0, y = CANVAS_SIZE - 18, w = CANVAS_SIZE, h = 16 },
   }
 end
 
-local function stopWave()
-  if waveTimer then
-    waveTimer:stop()
-    waveTimer = nil
-  end
-  if pill then
-    for i = 1, BAR_COUNT do
-      pill["bar" .. i].fillColor = { red = 0.9, green = 0.25, blue = 0.25, alpha = 0 }
-    end
+-- Stop any running animation
+local function stopAnimation()
+  if orbTimer then
+    orbTimer:stop()
+    orbTimer = nil
   end
 end
 
-local function stopBreathe()
-  if breatheTimer then
-    breatheTimer:stop()
-    breatheTimer = nil
-  end
-  if pill then
-    for i = 1, BAR_COUNT do
-      pill["bar" .. i].fillColor = { red = 0.9, green = 0.25, blue = 0.25, alpha = 0 }
-    end
-  end
-end
-
-local function stopFlash()
-  if flashTimer then
-    flashTimer:stop()
-    flashTimer = nil
-  end
-end
-
--- Flowing wave animation — bars form a sine wave pattern that travels
--- horizontally, with amplitude driven by mic level. Creates a liquid,
--- organic audio visualizer look rather than bars bouncing in unison.
-local function startWave(color)
-  stopWave()
-  wavePhase = 0
+-- Recording animation: Siri-style swirling, amplitude-reactive
+-- Layers rotate and expand with voice, creating the signature liquid effect
+local function startRecordingAnimation()
+  stopAnimation()
+  orbAngle = 0
   micLevel = 0
   micLevelSmoothed = 0
-  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
-  local startX = SHADOW_PAD + (currentWidth - totalBarsWidth) / 2
+  orbScale = 1
+  orbTargetScale = 1
+  orbMode = "recording"
+  rotationSpeed = 0.06  -- moderate speed for listening
 
-  waveTimer = hs.timer.doEvery(0.025, function()  -- ~40fps for smooth motion
-    wavePhase = wavePhase + 0.18  -- wave speed
-    -- Smooth mic level transitions
-    micLevelSmoothed = micLevelSmoothed + (micLevel - micLevelSmoothed) * 0.4
-    if not pill then return end
+  local center = CANVAS_SIZE / 2
+  local radius = ORB_DIAMETER / 2
 
-    for i = 1, BAR_COUNT do
-      local p = barParams[i]
+  orbTimer = hs.timer.doEvery(0.016, function()  -- ~60fps
+    -- Smooth mic level and scale
+    micLevelSmoothed = micLevelSmoothed + (micLevel - micLevelSmoothed) * 0.25
+    orbTargetScale = 1 + micLevelSmoothed * 0.35  -- grow up to 35% with amplitude
+    orbScale = orbScale + (orbTargetScale - orbScale) * 0.15
 
-      -- Position along the wave (0 to 1 across all bars)
-      local position = (i - 1) / (BAR_COUNT - 1)
+    -- Rotation speed increases slightly with amplitude
+    local dynamicSpeed = rotationSpeed * (1 + micLevelSmoothed * 0.5)
+    orbAngle = orbAngle + dynamicSpeed
 
-      -- Primary traveling wave — flows left to right
-      local travelingWave = math.sin(wavePhase + position * math.pi * 2)
+    if not orb then return end
 
-      -- Secondary wave at different frequency for organic feel
-      local secondaryWave = math.sin(wavePhase * 0.7 + position * math.pi * 3 + p.phase2) * 0.3
+    local scaledRadius = radius * orbScale
 
-      -- Combine waves: primary + secondary + small random variation
-      local combinedWave = travelingWave * 0.7 + secondaryWave + math.sin(wavePhase * p.freq3 + p.phase3) * 0.15
+    -- Update glows with scale and subtle color shift
+    local glowHue = (orbAngle * 0.25) % (math.pi * 2)
+    local gr = 0.35 + 0.15 * math.sin(glowHue)
+    local gg = 0.35 + 0.15 * math.sin(glowHue + 2.1)
+    local gb = 0.85 + 0.10 * math.sin(glowHue + 4.2)
 
-      -- Normalize to 0-1 range
-      combinedWave = (combinedWave + 1.15) / 2.3
+    orb["glow5"].radius = scaledRadius * 1.9
+    orb["glow5"].fillColor = { red = gr * 0.4, green = gg * 0.5, blue = gb, alpha = 0.025 + micLevelSmoothed * 0.02 }
 
-      -- Base amplitude (idle) + mic-driven boost
-      local baseAmplitude = 0.25 + 0.15 * math.sin(wavePhase * 0.3 + p.phase1)
-      local micBoost = micLevelSmoothed * p.sensitivity * 0.7
-      local amplitude = baseAmplitude + micBoost
+    orb["glow4"].radius = scaledRadius * 1.6
+    orb["glow4"].fillColor = { red = gr * 0.5, green = gg * 0.55, blue = gb, alpha = 0.04 + micLevelSmoothed * 0.03 }
 
-      -- Final height: wave shape modulated by amplitude
-      local targetRatio = amplitude * (0.4 + 0.6 * combinedWave)
-      targetRatio = math.max(0.1, math.min(1, targetRatio))
-      local targetHeight = BAR_MIN_H + (BAR_MAX_H - BAR_MIN_H) * targetRatio
+    orb["glow3"].radius = scaledRadius * 1.4
+    orb["glow3"].fillColor = { red = gr * 0.6, green = gg * 0.5, blue = gb, alpha = 0.055 + micLevelSmoothed * 0.04 }
 
-      -- Smooth spring physics
-      local displacement = targetHeight - p.currentHeight
-      p.velocity = p.velocity * 0.75 + displacement * 0.2
-      p.currentHeight = p.currentHeight + p.velocity
+    orb["glow2"].radius = scaledRadius * 1.2
+    orb["glow2"].fillColor = { red = gr * 0.7, green = gg * 0.5, blue = gb, alpha = 0.08 + micLevelSmoothed * 0.05 }
 
-      local height = math.max(BAR_MIN_H, math.min(BAR_MAX_H, p.currentHeight))
-      local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
-      local barY = SHADOW_PAD + (PILL_H - height) / 2
+    orb["glow1"].radius = scaledRadius * 1.05
+    orb["glow1"].fillColor = { red = gr * 0.8, green = gg * 0.55, blue = gb, alpha = 0.11 + micLevelSmoothed * 0.06 }
 
-      pill["bar" .. i].frame = {
-        x = barX,
-        y = barY,
-        w = BAR_WIDTH,
-        h = height,
-      }
+    -- Animate each color layer - finer orbits, smoother motion
+    for i = 1, LAYER_COUNT do
+      local p = layerParams[i]
+      local layerAngle = orbAngle * p.speedMult * p.direction + p.angleOffset
 
-      local alpha = 0.6 + 0.35 * combinedWave
-      pill["bar" .. i].fillColor = {
-        red = color.r, green = color.g, blue = color.b,
-        alpha = alpha,
+      -- Orbit radius expands with amplitude
+      local orbitR = p.orbitRadius * (1 + micLevelSmoothed * 0.5)
+
+      -- Position on orbit
+      local lx = center + math.cos(layerAngle) * orbitR
+      local ly = center + math.sin(layerAngle) * orbitR
+
+      -- Subtle size pulses
+      local sizePulse = 1 + 0.1 * math.sin(orbAngle * 2.5 + i * 0.5) + micLevelSmoothed * 0.2
+      local layerSize = p.size * sizePulse * orbScale
+
+      -- Smoother color intensity variation
+      local color = SIRI_COLORS[i]
+      local intensity = 0.7 + 0.2 * math.sin(orbAngle * 1.8 + i * 0.6) + micLevelSmoothed * 0.15
+
+      orb["layer" .. i].center = { x = lx, y = ly }
+      orb["layer" .. i].radius = layerSize
+      orb["layer" .. i].fillGradientColors = {
+        { red = color.r * intensity, green = color.g * intensity, blue = color.b * intensity, alpha = 0.45 + micLevelSmoothed * 0.2 },
+        { red = color.r * intensity, green = color.g * intensity, blue = color.b * intensity, alpha = 0.0 },
       }
     end
+
+    -- Animate center wave particles - finer fluid scatter/gather
+    for i = 1, WAVE_COUNT do
+      local w = waveParams[i]
+      local waveAngle = orbAngle * w.speedMult * w.direction + w.phase
+
+      -- Scatter outward with amplitude, gather back when quiet
+      local scatterAmount = micLevelSmoothed * 0.7
+      local gatherPulse = math.sin(orbAngle * w.waveFreq + w.phase) * 0.5 + 0.5
+      local dynamicOrbit = w.orbitRadius * (0.25 + gatherPulse * 0.6 + scatterAmount)
+
+      -- Position on wave orbit
+      local wx = center + math.cos(waveAngle) * dynamicOrbit * orbScale
+      local wy = center + math.sin(waveAngle) * dynamicOrbit * orbScale
+
+      -- Subtle size pulses
+      local sizePulse = 1 + 0.2 * math.sin(orbAngle * 3.5 + i * 0.5)
+      local gatherSize = 1 + (1 - scatterAmount) * 0.3
+      local waveSize = w.baseRadius * sizePulse * gatherSize * orbScale
+
+      -- Smoother color intensity
+      local color = SIRI_COLORS[w.colorIndex]
+      local intensity = 0.75 + 0.2 * math.sin(orbAngle * 2.2 + i * 0.4)
+
+      orb["wave" .. i].center = { x = wx, y = wy }
+      orb["wave" .. i].radius = waveSize
+      orb["wave" .. i].fillGradientColors = {
+        { red = color.r * intensity, green = color.g * intensity, blue = color.b * intensity, alpha = 0.8 },
+        { red = color.r * intensity, green = color.g * intensity, blue = color.b * intensity, alpha = 0.2 },
+      }
+    end
+
+    -- Core brightens with amplitude - smaller, crisper
+    local coreSize = scaledRadius * (0.10 + micLevelSmoothed * 0.05)
+    orb["core"].center = { x = center, y = center }
+    orb["core"].radius = coreSize
+    orb["core"].fillGradientColors = {
+      { white = 1, alpha = 0.95 + micLevelSmoothed * 0.05 },
+      { white = 1, alpha = 0.15 + micLevelSmoothed * 0.15 },
+    }
   end)
 end
 
--- Calm breathing animation for transcribing state. Bars gently pulse with
--- a flowing wave pattern, shifting between pink and violet. Much slower and
--- more meditative than the recording animation — clearly "thinking", not
--- "listening". Uses the same organic multi-wave approach for consistency.
-local function startBreathe(fromColor, toColor)
-  stopBreathe()
-  breathePhase = 0
-  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
-  local startX = SHADOW_PAD + (currentWidth - totalBarsWidth) / 2
+-- Processing animation: Faster rotation (2.2x like Siri's "thinking" state)
+-- No size changes, just accelerated swirl
+local function startProcessingAnimation()
+  stopAnimation()
+  orbMode = "processing"
+  rotationSpeed = 0.13  -- 2.2x faster rotation for "thinking"
+  orbScale = 1
+  orbTargetScale = 1
 
-  breatheTimer = hs.timer.doEvery(0.03, function()
-    breathePhase = breathePhase + 0.04  -- slower than recording
-    if not pill then return end
+  local center = CANVAS_SIZE / 2
+  local radius = ORB_DIAMETER / 2
 
-    for i = 1, BAR_COUNT do
-      local p = barParams[i]
+  orbTimer = hs.timer.doEvery(0.016, function()  -- ~60fps
+    orbAngle = orbAngle + rotationSpeed
 
-      -- Layered waves for organic movement (slower frequencies for calm feel)
-      local wave1 = math.sin(breathePhase * p.freq1 * 0.6 + p.phase1) * 0.5
-      local wave2 = math.sin(breathePhase * p.freq2 * 0.5 + p.phase2) * 0.35
-      local wave3 = math.sin(breathePhase * p.freq3 * 0.4 + p.phase3) * 0.15
-      local combinedWave = (wave1 + wave2 + wave3) * 0.5 + 0.5
+    if not orb then return end
 
-      -- Color mixing based on combined wave
-      local mix = combinedWave
+    -- Gentle breathing without amplitude
+    local breathe = 0.5 + 0.5 * math.sin(orbAngle * 0.4)
 
-      -- Height breathes gently: 40-75% of max, with spring smoothing
-      local targetRatio = 0.4 + 0.35 * combinedWave
-      local targetHeight = BAR_MIN_H + (BAR_MAX_H - BAR_MIN_H) * targetRatio
+    -- Update glows with subtle shifting colors
+    local glowHue = (orbAngle * 0.4) % (math.pi * 2)
+    local gr = 0.35 + 0.2 * math.sin(glowHue)
+    local gg = 0.35 + 0.2 * math.sin(glowHue + 2.1)
+    local gb = 0.80 + 0.15 * math.sin(glowHue + 4.2)
 
-      -- Gentle spring physics for smooth transitions
-      local displacement = targetHeight - p.currentHeight
-      p.velocity = p.velocity * 0.85 + displacement * 0.08
-      p.currentHeight = p.currentHeight + p.velocity
+    orb["glow5"].radius = radius * (1.85 + breathe * 0.05)
+    orb["glow5"].fillColor = { red = gr * 0.4, green = gg * 0.5, blue = gb, alpha = 0.03 }
 
-      local height = math.max(BAR_MIN_H, math.min(BAR_MAX_H, p.currentHeight))
-      local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
-      local barY = SHADOW_PAD + (PILL_H - height) / 2
+    orb["glow4"].radius = radius * (1.55 + breathe * 0.05)
+    orb["glow4"].fillColor = { red = gr * 0.5, green = gg * 0.55, blue = gb, alpha = 0.05 }
 
-      pill["bar" .. i].frame = {
-        x = barX,
-        y = barY,
-        w = BAR_WIDTH,
-        h = height,
-      }
-      -- Smooth color transition with gentle alpha pulse
-      local alpha = 0.65 + 0.25 * combinedWave
-      pill["bar" .. i].fillColor = {
-        red = fromColor.r + (toColor.r - fromColor.r) * mix,
-        green = fromColor.g + (toColor.g - fromColor.g) * mix,
-        blue = fromColor.b + (toColor.b - fromColor.b) * mix,
-        alpha = alpha,
+    orb["glow3"].radius = radius * (1.35 + breathe * 0.05)
+    orb["glow3"].fillColor = { red = gr * 0.6, green = gg * 0.5, blue = gb, alpha = 0.07 }
+
+    orb["glow2"].radius = radius * (1.18 + breathe * 0.05)
+    orb["glow2"].fillColor = { red = gr * 0.7, green = gg * 0.5, blue = gb, alpha = 0.10 }
+
+    orb["glow1"].radius = radius * (1.03 + breathe * 0.05)
+    orb["glow1"].fillColor = { red = gr * 0.8, green = gg * 0.55, blue = gb, alpha = 0.14 }
+
+    -- Layers rotate faster but maintain size
+    for i = 1, LAYER_COUNT do
+      local p = layerParams[i]
+      local layerAngle = orbAngle * p.speedMult * p.direction + p.angleOffset
+
+      local lx = center + math.cos(layerAngle) * p.orbitRadius
+      local ly = center + math.sin(layerAngle) * p.orbitRadius
+
+      local sizePulse = 1 + 0.08 * math.sin(orbAngle * 2.8 + i * 0.4)
+      local layerSize = p.size * sizePulse
+
+      local color = SIRI_COLORS[i]
+      local intensity = 0.75 + 0.18 * math.sin(orbAngle * 2.2 + i * 0.5)
+
+      orb["layer" .. i].center = { x = lx, y = ly }
+      orb["layer" .. i].radius = layerSize
+      orb["layer" .. i].fillGradientColors = {
+        { red = color.r * intensity, green = color.g * intensity, blue = color.b * intensity, alpha = 0.5 },
+        { red = color.r * intensity, green = color.g * intensity, blue = color.b * intensity, alpha = 0.0 },
       }
     end
+
+    -- Wave particles swirl faster during processing
+    for i = 1, WAVE_COUNT do
+      local w = waveParams[i]
+      local waveAngle = orbAngle * w.speedMult * 1.4 * w.direction + w.phase
+
+      -- Continuous gather/scatter wave pattern
+      local gatherPulse = math.sin(orbAngle * w.waveFreq * 1.2 + w.phase) * 0.5 + 0.5
+      local dynamicOrbit = w.orbitRadius * (0.3 + gatherPulse * 0.55)
+
+      local wx = center + math.cos(waveAngle) * dynamicOrbit
+      local wy = center + math.sin(waveAngle) * dynamicOrbit
+
+      -- Subtle pulsing size
+      local sizePulse = 1 + 0.18 * math.sin(orbAngle * 4 + i * 0.5)
+      local waveSize = w.baseRadius * sizePulse * (0.9 + gatherPulse * 0.15)
+
+      local color = SIRI_COLORS[w.colorIndex]
+      local intensity = 0.8 + 0.15 * math.sin(orbAngle * 2.8 + i * 0.4)
+
+      orb["wave" .. i].center = { x = wx, y = wy }
+      orb["wave" .. i].radius = waveSize
+      orb["wave" .. i].fillGradientColors = {
+        { red = color.r * intensity, green = color.g * intensity, blue = color.b * intensity, alpha = 0.75 },
+        { red = color.r * intensity, green = color.g * intensity, blue = color.b * intensity, alpha = 0.18 },
+      }
+    end
+
+    -- Core with gentle pulse - smaller, crisper
+    orb["core"].center = { x = center, y = center }
+    orb["core"].radius = radius * (0.10 + breathe * 0.025)
+    orb["core"].fillGradientColors = {
+      { white = 1, alpha = 0.95 },
+      { white = 1, alpha = 0.18 },
+    }
   end)
 end
 
+-- Status colors (kept for text messages)
 local COLOR_RED = { r = 0.9, g = 0.25, b = 0.25 }
 local COLOR_AMBER = { r = 0.85, g = 0.6, b = 0.15 }
-local COLOR_GREEN = { r = 0.2, g = 0.65, b = 0.35 }
+local COLOR_GREEN = { r = 0.2, g = 0.75, b = 0.45 }
+local COLOR_BLUE = { r = 0.3, g = 0.5, b = 1.0 }
 
+-- Show recording state with animated orb
 local function showWaveform()
-  ensurePill()
-  layout(PILL_W)
-  stopBreathe()
-  stopFlash()
-  pill["label"].text = ""
-  pill:show(0.18) -- fluid fade-in rather than an instant pop
-  startWave(COLOR_RED)
+  ensureOrb()
+  orb:frame(orbFrame())
+  orb["label"].text = ""
+  orb["label"].textColor = { white = 1, alpha = 0 }
+  orb:show(0.2)
+  startRecordingAnimation()
 end
 
+-- Show processing state with calm breathing orb
 local function showProcessing()
-  ensurePill()
-  layout(PILL_W)
-  stopWave()
-  stopFlash()
-  pill["label"].text = ""
-  pill:show(0.18)
-  startBreathe(COLOR_PINK, COLOR_VIOLET)
+  ensureOrb()
+  orb:frame(orbFrame())
+  orb["label"].text = ""
+  orb["label"].textColor = { white = 1, alpha = 0 }
+  orb:show(0.2)
+  startProcessingAnimation()
 end
 
--- Flash all bars green briefly, then fade out the pill.
-local FLASH_DURATION = 0.3
-
+-- Show success with a bright flash effect
 local function showSuccessFlash(color)
-  ensurePill()
-  layout(PILL_W)
-  stopWave()
-  stopBreathe()
-  stopFlash()
-  pill["label"].text = ""
-  pill:show(0.15)
+  ensureOrb()
+  stopAnimation()
+  orbMode = "success"
+  orb:frame(orbFrame())
+  orb["label"].text = ""
 
-  -- Set all bars to success color at full height
-  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
-  local startX = SHADOW_PAD + (PILL_W - totalBarsWidth) / 2
-  local height = BAR_MAX_H * 0.7
+  local center = CANVAS_SIZE / 2
+  local radius = ORB_DIAMETER / 2
 
-  for i = 1, BAR_COUNT do
-    local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
-    local barY = SHADOW_PAD + (PILL_H - height) / 2
-    pill["bar" .. i].frame = {
-      x = barX,
-      y = barY,
-      w = BAR_WIDTH,
-      h = height,
+  -- Bright success state - all elements glow in success color
+  orb["glow5"].radius = radius * 1.8
+  orb["glow5"].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.12 }
+  orb["glow4"].radius = radius * 1.55
+  orb["glow4"].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.18 }
+  orb["glow3"].radius = radius * 1.35
+  orb["glow3"].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.24 }
+  orb["glow2"].radius = radius * 1.18
+  orb["glow2"].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.32 }
+  orb["glow1"].radius = radius * 1.03
+  orb["glow1"].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.40 }
+
+  for i = 1, LAYER_COUNT do
+    orb["layer" .. i].center = { x = center, y = center }
+    orb["layer" .. i].radius = radius * 0.7
+    orb["layer" .. i].fillGradientColors = {
+      { red = color.r, green = color.g, blue = color.b, alpha = 0.4 },
+      { red = color.r, green = color.g, blue = color.b, alpha = 0.0 },
     }
-    pill["bar" .. i].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.9 }
   end
+
+  -- Wave particles gather to center on success
+  for i = 1, WAVE_COUNT do
+    orb["wave" .. i].center = { x = center, y = center }
+    orb["wave" .. i].radius = radius * 0.03
+    orb["wave" .. i].fillGradientColors = {
+      { red = color.r, green = color.g, blue = color.b, alpha = 0.85 },
+      { red = color.r, green = color.g, blue = color.b, alpha = 0.35 },
+    }
+  end
+
+  orb["core"].center = { x = center, y = center }
+  orb["core"].radius = radius * 0.14
+  orb["core"].fillGradientColors = {
+    { white = 1, alpha = 0.98 },
+    { red = color.r, green = color.g, blue = color.b, alpha = 0.5 },
+  }
+
+  orb:show(0.15)
 end
 
--- Only used for the rare error/info message that actually needs to be
--- read (no speech detected, a request failing) -- widens into a capsule
--- with the bars on the left and text on the right.
+-- Show text message (for errors/info) with colored orb
 local function showSteady(text, color)
-  ensurePill()
-  layout(WIDE_W)
-  stopWave()
-  stopBreathe()
-  stopFlash()
-  -- Show bars at steady height with the status color, positioned on the left
-  local totalBarsWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
-  local startX = SHADOW_PAD + 8 -- left-aligned with small padding
-  local height = BAR_MAX_H * 0.5
-  for i = 1, BAR_COUNT do
-    local barX = startX + (i - 1) * (BAR_WIDTH + BAR_GAP)
-    local barY = SHADOW_PAD + (PILL_H - height) / 2
-    pill["bar" .. i].frame = {
-      x = barX,
-      y = barY,
-      w = BAR_WIDTH,
-      h = height,
+  ensureOrb()
+  stopAnimation()
+  orbMode = "text"
+  orb:frame(orbFrame())
+
+  local center = CANVAS_SIZE / 2
+  local radius = ORB_DIAMETER / 2
+
+  -- Set orb to a steady glow in the status color
+  orb["glow5"].radius = radius * 1.6
+  orb["glow5"].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.08 }
+  orb["glow4"].radius = radius * 1.4
+  orb["glow4"].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.12 }
+  orb["glow3"].radius = radius * 1.25
+  orb["glow3"].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.18 }
+  orb["glow2"].radius = radius * 1.1
+  orb["glow2"].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.25 }
+  orb["glow1"].radius = radius * 0.98
+  orb["glow1"].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.35 }
+
+  for i = 1, LAYER_COUNT do
+    orb["layer" .. i].center = { x = center, y = center }
+    orb["layer" .. i].radius = radius * 0.65
+    orb["layer" .. i].fillGradientColors = {
+      { red = color.r, green = color.g, blue = color.b, alpha = 0.35 },
+      { red = color.r, green = color.g, blue = color.b, alpha = 0.0 },
     }
-    pill["bar" .. i].fillColor = { red = color.r, green = color.g, blue = color.b, alpha = 0.7 }
   end
-  pill["label"].text = text
-  pill:show(0.18)
+
+  -- Wave particles in calm arrangement
+  for i = 1, WAVE_COUNT do
+    local golden = (i - 1) * 2.39996323
+    local wx = center + math.cos(golden) * radius * 0.18
+    local wy = center + math.sin(golden) * radius * 0.18
+    orb["wave" .. i].center = { x = wx, y = wy }
+    orb["wave" .. i].radius = radius * 0.028
+    orb["wave" .. i].fillGradientColors = {
+      { red = color.r, green = color.g, blue = color.b, alpha = 0.65 },
+      { red = color.r, green = color.g, blue = color.b, alpha = 0.2 },
+    }
+  end
+
+  orb["core"].center = { x = center, y = center }
+  orb["core"].radius = radius * 0.10
+  orb["core"].fillGradientColors = {
+    { white = 1, alpha = 0.85 },
+    { red = color.r, green = color.g, blue = color.b, alpha = 0.4 },
+  }
+
+  -- Show text below the orb
+  orb["label"].text = text
+  orb["label"].textColor = { white = 1, alpha = 0.95 }
+
+  orb:show(0.18)
 end
 
+-- Hide orb after delay with fade out
 local function hidePillAfter(delay)
   hideTimer = hs.timer.doAfter(delay, function()
-    stopWave()
-    stopBreathe()
-    stopFlash()
-    if pill then pill:hide(0.3) end -- fluid fade-out
+    stopAnimation()
+    if orb then orb:hide(0.35) end
   end)
 end
 
@@ -524,8 +643,8 @@ local LEARN_W, LEARN_H = 320, 90
 local function learnPopupFrame()
   local screen = (hs.mouse.getCurrentScreen() or hs.screen.mainScreen()):fullFrame()
   return {
-    x = screen.x + (screen.w - LEARN_W) / 2,
-    y = screen.y + screen.h - PILL_BOTTOM_MARGIN - PILL_H - LEARN_H - 14,
+    x = screen.x + (screen.w - LEARN_W) / 2,  -- centered above the orb
+    y = screen.y + screen.h - CANVAS_SIZE - ORB_MARGIN_BOTTOM - LEARN_H - 10,
     w = LEARN_W,
     h = LEARN_H,
   }
@@ -1093,13 +1212,15 @@ function M.start()
   if fnWatcher then
     fnWatcher:stop()
   end
-  -- Delete old pill canvas so ensurePill() creates a fresh one with the
+  -- Delete old orb canvas so ensureOrb() creates a fresh one with the
   -- current design (important when the HUD layout changes between versions).
-  if pill then
-    pill:delete()
-    pill = nil
+  stopAnimation()
+  if orb then
+    orb:delete()
+    orb = nil
   end
-  barParams = nil
+  layerParams = nil
+  waveParams = nil
   fnWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, handleFlagsChanged)
   fnWatcher:start()
 end
