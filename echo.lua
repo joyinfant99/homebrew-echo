@@ -1185,45 +1185,33 @@ end
 -- selection, calls /chat/message, pastes the result back.
 --------------------------------------------------------------------------
 
-local DOUBLE_TAP_THRESHOLD = 0.35  -- seconds between taps to count as double-tap
-local ctrlLastTapTime = 0
-local ctrlWasDown = false
-local ctrlWatcher = nil
 local rewriteTimer = nil  -- must stay referenced (GC gotcha)
+local rewriteHotkey = nil
 
 local function rewriteSelectedText()
-  -- Copy current selection to clipboard
+  hs.sound.getByName("Pop"):play()
+
   local oldClipboard = hs.pasteboard.getContents()
+
+  -- Copy selection
   hs.eventtap.keyStroke({"cmd"}, "c", 0)
 
-  -- Give the system a moment to update the clipboard
   rewriteTimer = hs.timer.doAfter(0.1, function()
     local selectedText = hs.pasteboard.getContents()
 
-    -- Check if we actually got new text (not the same as before, and not empty)
     if not selectedText or selectedText == "" or selectedText == oldClipboard then
       showSteady("No text selected", COLOR_AMBER)
       hidePillAfter(1.2)
       return
     end
 
-    -- Delete the selection now (while it's still selected) so we can paste the
-    -- replacement later without worrying about the selection being lost during
-    -- the API call. The original text is safe in selectedText if anything fails.
-    hs.eventtap.keyStroke({}, "delete", 0)
-
-    -- Show processing state
     showProcessing()
 
-    -- Call the rewrite API
     local requestBody = hs.json.encode({ text = selectedText })
 
     hs.task.new(M.config.curlPath, function(exitCode, stdOut, stdErr)
       if exitCode ~= 0 then
         print(string.format("Echo rewrite: curl exit=%s stderr=%s", tostring(exitCode), stdErr or "(none)"))
-        -- Restore original text on failure
-        hs.pasteboard.setContents(selectedText)
-        hs.eventtap.keyStroke({"cmd"}, "v", 0)
         showSteady("Rewrite failed", COLOR_RED)
         hidePillAfter(1.4)
         return
@@ -1232,20 +1220,15 @@ local function rewriteSelectedText()
       local ok, decoded = pcall(hs.json.decode, stdOut)
       if not ok or not decoded or not decoded.text then
         print(string.format("Echo rewrite: bad response body=%s", stdOut or "(empty)"))
-        -- Restore original text on failure
-        hs.pasteboard.setContents(selectedText)
-        hs.eventtap.keyStroke({"cmd"}, "v", 0)
         showSteady("Bad response", COLOR_RED)
         hidePillAfter(1.4)
         return
       end
 
-      -- Paste the polished text at cursor (selection was already deleted)
+      -- Put polished text in clipboard — user pastes with Cmd+V
       hs.pasteboard.setContents(decoded.text)
-      hs.eventtap.keyStroke({"cmd"}, "v", 0)
-
-      showSuccessFlash(COLOR_GREEN)
-      hidePillAfter(0.85)
+      showSteady("Cmd+V to paste", COLOR_GREEN)
+      hidePillAfter(2.5)
     end, {
       "-s", "-S", "-X", "POST",
       M.config.apiUrl .. "/rewrite",
@@ -1254,27 +1237,6 @@ local function rewriteSelectedText()
       "-d", requestBody,
     }):start()
   end)
-end
-
-local function handleCtrlFlagsChanged(event)
-  local isCtrlDown = event:getFlags().ctrl or false
-
-  -- Detect rising edge (ctrl just pressed)
-  if isCtrlDown and not ctrlWasDown then
-    local now = hs.timer.secondsSinceEpoch()
-    local timeSinceLastTap = now - ctrlLastTapTime
-
-    if timeSinceLastTap < DOUBLE_TAP_THRESHOLD then
-      -- Double-tap detected
-      ctrlLastTapTime = 0  -- reset to prevent triple-tap triggering again
-      rewriteSelectedText()
-    else
-      ctrlLastTapTime = now
-    end
-  end
-
-  ctrlWasDown = isCtrlDown
-  return false  -- don't consume the event
 end
 
 --------------------------------------------------------------------------
@@ -1314,8 +1276,8 @@ function M.start()
   if fnWatcher then
     fnWatcher:stop()
   end
-  if ctrlWatcher then
-    ctrlWatcher:stop()
+  if rewriteHotkey then
+    rewriteHotkey:delete()
   end
   -- Delete old orb canvas so ensureOrb() creates a fresh one with the
   -- current design (important when the HUD layout changes between versions).
@@ -1331,9 +1293,8 @@ function M.start()
   fnWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, handleFlagsChanged)
   fnWatcher:start()
 
-  -- Control key: double-tap to rewrite selected text
-  ctrlWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, handleCtrlFlagsChanged)
-  ctrlWatcher:start()
+  -- Cmd+Shift+R: rewrite selected text
+  rewriteHotkey = hs.hotkey.bind({"cmd", "shift"}, "r", rewriteSelectedText)
 end
 
 return M
