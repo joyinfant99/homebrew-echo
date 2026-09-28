@@ -42,6 +42,24 @@ local SIRI_COLORS = {
   { r = 0.10, g = 0.60, b = 0.95 },  -- sky
 }
 
+-- Warm gold/amber palette used only while rewriting typed text, so it reads
+-- as visibly different from the rainbow voice-dictation orb.
+local REWRITE_COLORS = {
+  { r = 1.00, g = 0.78, b = 0.25 },
+  { r = 1.00, g = 0.65, b = 0.20 },
+  { r = 1.00, g = 0.52, b = 0.22 },
+  { r = 0.98, g = 0.40, b = 0.30 },
+  { r = 1.00, g = 0.85, b = 0.45 },
+  { r = 1.00, g = 0.70, b = 0.35 },
+  { r = 0.95, g = 0.55, b = 0.15 },
+  { r = 1.00, g = 0.90, b = 0.55 },
+  { r = 1.00, g = 0.60, b = 0.40 },
+  { r = 0.98, g = 0.75, b = 0.20 },
+  { r = 1.00, g = 0.48, b = 0.28 },
+  { r = 1.00, g = 0.82, b = 0.38 },
+}
+local orbPalette = SIRI_COLORS  -- swapped to REWRITE_COLORS by showRewriting()
+
 -- More layers for smoother, higher-fidelity swirl
 local LAYER_COUNT = 12
 
@@ -368,6 +386,9 @@ local function startProcessingAnimation()
     local gr = 0.35 + 0.2 * math.sin(glowHue)
     local gg = 0.35 + 0.2 * math.sin(glowHue + 2.1)
     local gb = 0.80 + 0.15 * math.sin(glowHue + 4.2)
+    if orbPalette == REWRITE_COLORS then  -- warm glow: amber instead of blue-violet
+      gr, gg, gb = 1.0, 0.65 + 0.15 * math.sin(glowHue), 0.25
+    end
 
     orb["glow5"].radius = radius * (1.85 + breathe * 0.05)
     orb["glow5"].fillColor = { red = gr * 0.4, green = gg * 0.5, blue = gb, alpha = 0.03 }
@@ -395,7 +416,7 @@ local function startProcessingAnimation()
       local sizePulse = 1 + 0.08 * math.sin(orbAngle * 2.8 + i * 0.4)
       local layerSize = p.size * sizePulse
 
-      local color = SIRI_COLORS[i]
+      local color = orbPalette[i]
       local intensity = 0.75 + 0.18 * math.sin(orbAngle * 2.2 + i * 0.5)
 
       orb["layer" .. i].center = { x = lx, y = ly }
@@ -422,7 +443,7 @@ local function startProcessingAnimation()
       local sizePulse = 1 + 0.18 * math.sin(orbAngle * 4 + i * 0.5)
       local waveSize = w.baseRadius * sizePulse * (0.9 + gatherPulse * 0.15)
 
-      local color = SIRI_COLORS[w.colorIndex]
+      local color = orbPalette[w.colorIndex]
       local intensity = 0.8 + 0.15 * math.sin(orbAngle * 2.8 + i * 0.4)
 
       orb["wave" .. i].center = { x = wx, y = wy }
@@ -448,6 +469,7 @@ local COLOR_RED = { r = 0.9, g = 0.25, b = 0.25 }
 local COLOR_AMBER = { r = 0.85, g = 0.6, b = 0.15 }
 local COLOR_GREEN = { r = 0.2, g = 0.75, b = 0.45 }
 local COLOR_BLUE = { r = 0.3, g = 0.5, b = 1.0 }
+local COLOR_GOLD = { r = 1.0, g = 0.72, b = 0.2 }
 
 -- Show recording state with animated orb
 local function showWaveform()
@@ -461,7 +483,19 @@ end
 
 -- Show processing state with calm breathing orb
 local function showProcessing()
+  orbPalette = SIRI_COLORS
   ensureOrb()
+  orb:frame(orbFrame())
+  orb["label"].text = ""
+  orb["label"].textColor = { white = 1, alpha = 0 }
+  orb:show(0.2)
+  startProcessingAnimation()
+end
+
+-- Rewriting typed text: same swirl, warm gold palette
+local function showRewriting()
+  ensureOrb()
+  orbPalette = REWRITE_COLORS
   orb:frame(orbFrame())
   orb["label"].text = ""
   orb["label"].textColor = { white = 1, alpha = 0 }
@@ -1186,26 +1220,34 @@ end
 --------------------------------------------------------------------------
 
 local rewriteTimer = nil  -- must stay referenced (GC gotcha)
-local rewriteHotkey = nil
 
 local function rewriteSelectedText()
-  hs.sound.getByName("Pop"):play()
+  hs.sound.getByName("Morse"):play()  -- distinct from dictation's Frog
 
-  local oldClipboard = hs.pasteboard.getContents()
+  -- Compare pasteboard changeCount, not contents: re-selecting text that was
+  -- just pasted equals the clipboard, which used to read as "no selection".
+  local oldCount = hs.pasteboard.changeCount()
 
   -- Copy selection
   hs.eventtap.keyStroke({"cmd"}, "c", 0)
 
-  rewriteTimer = hs.timer.doAfter(0.1, function()
+  local attempts = 0
+  local function checkCopy()
+    if hs.pasteboard.changeCount() == oldCount and attempts < 8 then
+      attempts = attempts + 1
+      rewriteTimer = hs.timer.doAfter(0.05, checkCopy)
+      return
+    end
+
     local selectedText = hs.pasteboard.getContents()
 
-    if not selectedText or selectedText == "" or selectedText == oldClipboard then
+    if hs.pasteboard.changeCount() == oldCount or not selectedText or selectedText == "" then
       showSteady("No text selected", COLOR_AMBER)
       hidePillAfter(1.2)
       return
     end
 
-    showProcessing()
+    showRewriting()
 
     local requestBody = hs.json.encode({ text = selectedText })
 
@@ -1227,7 +1269,8 @@ local function rewriteSelectedText()
 
       -- Put polished text in clipboard — user pastes with Cmd+V
       hs.pasteboard.setContents(decoded.text)
-      showSteady("Cmd+V to paste", COLOR_GREEN)
+      hs.sound.getByName("Glass"):play()
+      showSteady("Cmd+V to paste", COLOR_GOLD)
       hidePillAfter(2.5)
     end, {
       "-s", "-S", "-X", "POST",
@@ -1236,7 +1279,9 @@ local function rewriteSelectedText()
       "-H", "Content-Type: application/json",
       "-d", requestBody,
     }):start()
-  end)
+  end
+
+  rewriteTimer = hs.timer.doAfter(0.05, checkCopy)
 end
 
 --------------------------------------------------------------------------
@@ -1270,15 +1315,58 @@ local function handleFlagsChanged(event)
   return false
 end
 
+-- Rewrite trigger: a solo tap of Right Option (keyCode 61). Left Option is
+-- left alone since it types special characters and is used in shortcuts.
+-- Fires on release, and only if nothing else happened while it was held
+-- (no other key, click, or modifier, and held < 0.6s), so Option+key combos
+-- and Option+click never trigger a rewrite.
+local RIGHT_OPTION_KEYCODE = 61
+local REWRITE_TAP_MAX = 0.6
+local rewriteWatcher = nil
+local rightOptDown = false
+local rightOptClean = false
+local rightOptTime = 0
+
+local function handleRewriteEvent(event)
+  local t = event:getType()
+  local types = hs.eventtap.event.types
+
+  if t == types.flagsChanged then
+    local flags = event:getFlags()
+    if event:getKeyCode() == RIGHT_OPTION_KEYCODE then
+      if flags.alt and not rightOptDown then
+        rightOptDown = true
+        rightOptTime = hs.timer.secondsSinceEpoch()
+        -- only a pure Right Option press qualifies
+        rightOptClean = not (flags.cmd or flags.ctrl or flags.shift or flags.fn)
+      elseif not flags.alt and rightOptDown then
+        rightOptDown = false
+        if rightOptClean and hs.timer.secondsSinceEpoch() - rightOptTime < REWRITE_TAP_MAX then
+          rewriteSelectedText()
+        end
+        rightOptClean = false
+      end
+    else
+      rightOptClean = false  -- another modifier changed mid-hold
+    end
+  else
+    rightOptClean = false    -- a key or click happened mid-hold
+  end
+
+  return false
+end
+
 function M.start()
   -- Reload Config re-runs this without the process restarting, so stale
   -- watchers and canvases from the previous load must be cleaned up first.
   if fnWatcher then
     fnWatcher:stop()
   end
-  if rewriteHotkey then
-    rewriteHotkey:delete()
+  if rewriteWatcher then
+    rewriteWatcher:stop()
   end
+  rightOptDown = false
+  rightOptClean = false
   -- Delete old orb canvas so ensureOrb() creates a fresh one with the
   -- current design (important when the HUD layout changes between versions).
   stopAnimation()
@@ -1293,8 +1381,13 @@ function M.start()
   fnWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, handleFlagsChanged)
   fnWatcher:start()
 
-  -- Cmd+Shift+R: rewrite selected text
-  rewriteHotkey = hs.hotkey.bind({"cmd", "shift"}, "r", rewriteSelectedText)
+  -- Right Option (tap): rewrite selected text
+  local types = hs.eventtap.event.types
+  rewriteWatcher = hs.eventtap.new(
+    { types.flagsChanged, types.keyDown, types.leftMouseDown, types.rightMouseDown },
+    handleRewriteEvent
+  )
+  rewriteWatcher:start()
 end
 
 return M
