@@ -1220,9 +1220,14 @@ end
 --------------------------------------------------------------------------
 
 local rewriteTimer = nil  -- must stay referenced (GC gotcha)
+-- Preloaded once: getByName() on every tap hits disk and delays the sound.
+local rewriteStartSound = hs.sound.getByName("Bottle")
+local rewriteDoneSound = hs.sound.getByName("Glass")
 
 local function rewriteSelectedText()
-  hs.sound.getByName("Bottle"):play()  -- distinct from dictation's Frog
+  -- Instant feedback first: sound + orb before the copy round trip.
+  if rewriteStartSound then rewriteStartSound:stop():play() end
+  showRewriting()
 
   -- Compare pasteboard changeCount, not contents: re-selecting text that was
   -- just pasted equals the clipboard, which used to read as "no selection".
@@ -1247,8 +1252,6 @@ local function rewriteSelectedText()
       return
     end
 
-    showRewriting()
-
     local requestBody = hs.json.encode({ text = selectedText })
 
     hs.task.new(M.config.curlPath, function(exitCode, stdOut, stdErr)
@@ -1269,7 +1272,7 @@ local function rewriteSelectedText()
 
       -- Put polished text in clipboard — user pastes with Cmd+V
       hs.pasteboard.setContents(decoded.text)
-      hs.sound.getByName("Glass"):play()
+      if rewriteDoneSound then rewriteDoneSound:stop():play() end
       showSteady("Cmd+V to paste", COLOR_GOLD)
       hidePillAfter(2.5)
     end, {
