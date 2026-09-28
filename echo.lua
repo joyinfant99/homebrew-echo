@@ -1222,7 +1222,7 @@ end
 local rewriteTimer = nil  -- must stay referenced (GC gotcha)
 
 local function rewriteSelectedText()
-  hs.sound.getByName("Morse"):play()  -- distinct from dictation's Frog
+  hs.sound.getByName("Bottle"):play()  -- distinct from dictation's Frog
 
   -- Compare pasteboard changeCount, not contents: re-selecting text that was
   -- just pasted equals the clipboard, which used to read as "no selection".
